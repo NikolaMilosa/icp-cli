@@ -9,6 +9,7 @@ pub(crate) mod environment;
 pub(crate) mod identity;
 pub(crate) mod network;
 pub(crate) mod new;
+pub(crate) mod package;
 pub(crate) mod parsers;
 pub(crate) mod project;
 pub(crate) mod settings;
@@ -31,6 +32,8 @@ pub(crate) enum Command {
     #[command(subcommand)]
     Network(network::Command),
     New(new::IcpGenerateArgs),
+    #[command(subcommand)]
+    Package(package::Command),
     #[command(subcommand)]
     Project(project::Command),
     Settings(settings::SettingsArgs),

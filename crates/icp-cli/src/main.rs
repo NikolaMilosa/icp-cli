@@ -382,6 +382,13 @@ async fn dispatch(ctx: &icp::context::Context, command: Command) -> Result<(), E
         // New
         Command::New(args) => commands::new::exec(ctx, &args).await?,
 
+        // Package
+        Command::Package(cmd) => match cmd {
+            commands::package::Command::Create(args) => {
+                commands::package::create::exec(ctx, &args).await?
+            }
+        },
+
         // Project
         Command::Project(cmd) => match cmd {
             commands::project::Command::Show(args) => {

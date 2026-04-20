@@ -1,0 +1,33 @@
+[package]
+name = "icp-packaging"
+version.workspace = true
+edition = { workspace = true }
+license = { workspace = true }
+publish.workspace = true
+
+# MVP crate for creating and consuming ICP application bundles (.icp-app zip files).
+# See `packaging_design.md` at the repo root for the full design.
+#
+# Corners cut for the demo (tracked intentionally):
+#   - Only the three canister fields that users care about are supported today:
+#       * init_arg
+#       * dependencies
+#       * upgrade_arg
+#     Other fields from the full design (controllers, env_variables, cycles,
+#     icons, screenshots, shortcuts, asset canisters, candid type encoding,
+#     manifest schema validation, cycle detection beyond a trivial check, etc.)
+#     are intentionally left out.
+#   - No reproducibility / signing.
+#   - No asset canister handling (`assets/` directory is never written).
+#   - No actual installation driver — `consume` only extracts + parses the
+#     bundle so another component can drive installation.
+
+[dependencies]
+flate2 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+snafu = { workspace = true }
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
+
+[lints]
+workspace = true
