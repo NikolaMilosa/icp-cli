@@ -40,20 +40,39 @@
 //!
 //! For every canister in the bundle the consumer injects a handful of
 //! built-in environment variables on top of anything declared in the
-//! manifest:
+//! manifest. There are two groups:
 //!
-//! | Name                     | Value                                               |
-//! |--------------------------|-----------------------------------------------------|
-//! | `__CANISTER_NAME`        | name of *this* canister (manifest key)              |
-//! | `__CANISTER_DESCRIPTION` | `Manifest.description` (empty string if absent)     |
-//! | `__CANISTER_PROJECT`     | `Manifest.name` (the application name)              |
-//! | `<DEP>_CANISTER_ID`      | principal of each declared dependency, uppercased   |
+//! ## Metadata (`__META_*`) — internal-only
 //!
-//! `<DEP>_CANISTER_ID` is set for every name in
-//! [`crate::CanisterEntry::dependencies`], using the canister id supplied
-//! via [`Consumer::set_canister_id`]. If a dependency has not yet been
-//! assigned an id, [`Consumer::env_variables_for`] / [`Consumer::install_plan`]
-//! will return an error — the caller is expected to allocate ids first.
+//! Stored on the canister but intentionally *not* exposed to the
+//! frontend (the `ic_env` cookie only surfaces `PUBLIC_*` keys). The
+//! canister itself can read these with `ic_env::get_env_var` etc.
+//!
+//! | Name                | Value                                            |
+//! |---------------------|--------------------------------------------------|
+//! | `__META_NAME`       | name of *this* canister (manifest key)           |
+//! | `__META_DESCRIPTION`| `Manifest.description` (empty string if absent)  |
+//! | `__META_PROJECT`    | `Manifest.name` (the application name)           |
+//!
+//! ## Dependency ids (`PUBLIC_CANISTER_ID:<dep>`) — frontend-visible
+//!
+//! For every dependency declared in the canister's manifest entry, one
+//! key of the form `PUBLIC_CANISTER_ID:<dep>`. The name is kept verbatim
+//! from the manifest; a literal colon separates the prefix from the
+//! name. This matches the convention consumed by frontends built against
+//! the icp-cli asset canister (wasm >= 0.30.2), which read values out of
+//! the `ic_env` cookie with:
+//!
+//! ```text
+//! URLSearchParams.get("PUBLIC_CANISTER_ID:backend")
+//! ```
+//!
+//! If a dependency has not yet been assigned an id,
+//! [`Consumer::env_variables_for`] / [`Consumer::install_plan`] will
+//! return an error — the caller is expected to allocate ids first.
+//!
+//! Both `__META_` and `PUBLIC_CANISTER_` are reserved prefixes:
+//! [`Consumer::provide_env_var`] refuses keys that start with either.
 
 use std::collections::BTreeMap;
 
@@ -164,8 +183,8 @@ pub struct InstallStep {
     /// Whether this should be treated as a first-time install or an upgrade.
     pub mode: InstallMode,
     /// Final environment variable map the caller should apply via
-    /// `update_settings`. Includes the synthetic `__CANISTER_*` variables
-    /// and `<DEP>_CANISTER_ID` entries.
+    /// `update_settings`. Includes the synthetic `__META_*` metadata
+    /// variables and the `PUBLIC_CANISTER_ID:<dep>` entries.
     pub env_variables: BTreeMap<String, String>,
 }
 
@@ -241,14 +260,18 @@ pub struct Consumer {
     supplied_env_vars: BTreeMap<(String, String), String>,
 }
 
-/// Reserved env var keys — the consumer fills these in itself and rejects
-/// attempts by the caller to override them.
-const RESERVED_ENV_PREFIX: &str = "__CANISTER_";
-const RESERVED_ENV_KEYS: &[&str] = &[
-    "__CANISTER_NAME",
-    "__CANISTER_DESCRIPTION",
-    "__CANISTER_PROJECT",
-];
+/// Reserved env var key prefixes. `provide_env_var` rejects any key that
+/// starts with one of these so the caller can't shadow a synthetic slot.
+///
+/// - `__META_` — bundle/canister metadata (see `env_variables_for`).
+/// - `PUBLIC_CANISTER_` — dependency-canister-id keys that the asset
+///   canister would surface to the frontend via `ic_env`.
+const RESERVED_ENV_PREFIXES: &[&str] = &["__META_", "PUBLIC_CANISTER_"];
+
+/// Key prefix used to expose a dependency's canister id. Matches the
+/// convention the icp-cli asset canister serves via the `ic_env` cookie
+/// (frontend reads `URLSearchParams.get("PUBLIC_CANISTER_ID:backend")`).
+const PUBLIC_CANISTER_ID_PREFIX: &str = "PUBLIC_CANISTER_ID:";
 
 impl Consumer {
     /// Construct a consumer from a bundle file on disk.
@@ -433,8 +456,10 @@ impl Consumer {
     }
 
     /// Provide a value for an environment variable the manifest left as
-    /// `null`. Fails if the canister or key is unknown, or if the key is
-    /// one of the reserved `__CANISTER_*` slots.
+    /// `null`. Fails if the canister or key is unknown, or if the key
+    /// starts with one of the reserved prefixes (`__META_`,
+    /// `PUBLIC_CANISTER_`). See the module-level docs for the full list
+    /// of synthetic variables the consumer manages itself.
     pub fn provide_env_var(
         &mut self,
         canister: &str,
@@ -442,7 +467,7 @@ impl Consumer {
         value: impl Into<String>,
     ) -> Result<(), ConsumeError> {
         let entry = self.canister(canister)?;
-        if key.starts_with(RESERVED_ENV_PREFIX) || RESERVED_ENV_KEYS.contains(&key) {
+        if RESERVED_ENV_PREFIXES.iter().any(|p| key.starts_with(p)) {
             return ReservedEnvVarSnafu {
                 canister: canister.to_string(),
                 key: key.to_string(),
@@ -469,8 +494,10 @@ impl Consumer {
     /// `update_settings`. It includes:
     ///   - user-declared variables from the manifest (with `null`s resolved
     ///     from [`Self::provide_env_var`]),
-    ///   - synthetic `__CANISTER_NAME` / `__CANISTER_DESCRIPTION` / `__CANISTER_PROJECT`,
-    ///   - `<DEP>_CANISTER_ID` for every declared dependency.
+    ///   - `__META_NAME` / `__META_DESCRIPTION` / `__META_PROJECT`
+    ///     (bundle/canister metadata; kept internal to the canister),
+    ///   - `PUBLIC_CANISTER_ID:<dep>` for every declared dependency
+    ///     (surfaced to the frontend via `ic_env`).
     ///
     /// Fails if any dependency's canister id has not been set, or if a
     /// `null` manifest variable has not been resolved.
@@ -494,21 +521,23 @@ impl Consumer {
             out.insert(k.clone(), value);
         }
 
-        // Synthetic project/description/name. These take precedence over
-        // anything the user tried to declare (they can't: provide_env_var
-        // rejects reserved keys, and the manifest writer shouldn't set
-        // them either — if they did we silently overwrite).
-        out.insert("__CANISTER_NAME".to_string(), name.to_string());
+        // Internal metadata. These take precedence over anything the
+        // caller tried to declare: provide_env_var rejects reserved
+        // prefixes, and the manifest writer shouldn't set them either
+        // — if they did we silently overwrite.
+        out.insert("__META_NAME".to_string(), name.to_string());
         out.insert(
-            "__CANISTER_DESCRIPTION".to_string(),
+            "__META_DESCRIPTION".to_string(),
             self.project_description().to_string(),
         );
         out.insert(
-            "__CANISTER_PROJECT".to_string(),
+            "__META_PROJECT".to_string(),
             self.project_name().to_string(),
         );
 
-        // <DEP>_CANISTER_ID for every dependency.
+        // PUBLIC_CANISTER_ID:<dep> for every dependency. This format
+        // matches what the icp-cli asset canister serves via the ic_env
+        // cookie and what frontends read at runtime.
         for dep in &entry.dependencies {
             let id = self
                 .canister_ids
@@ -516,7 +545,34 @@ impl Consumer {
                 .ok_or_else(|| ConsumeError::MissingCanisterId {
                     canister: dep.clone(),
                 })?;
-            out.insert(dep_env_var_key(dep), id.clone());
+            out.insert(public_canister_id_key(dep), id.clone());
+        }
+
+        // Synthetic project/description/name. These take precedence over
+        // anything the user tried to declare (they can't: provide_env_var
+        // rejects reserved keys, and the manifest writer shouldn't set
+        // them either — if they did we silently overwrite).
+        out.insert("PUBLIC_CANISTER_NAME".to_string(), name.to_string());
+        out.insert(
+            "PUBLIC_CANISTER_DESCRIPTION".to_string(),
+            self.project_description().to_string(),
+        );
+        out.insert(
+            "PUBLIC_CANISTER_PROJECT".to_string(),
+            self.project_name().to_string(),
+        );
+
+        // PUBLIC_CANISTER_ID:<dep> for every dependency. The key format
+        // matches what the icp-cli asset canister serves via the ic_env
+        // cookie and what frontends read at runtime.
+        for dep in &entry.dependencies {
+            let id = self
+                .canister_ids
+                .get(dep)
+                .ok_or_else(|| ConsumeError::MissingCanisterId {
+                    canister: dep.clone(),
+                })?;
+            out.insert(public_canister_id_key(dep), id.clone());
         }
 
         Ok(out)
@@ -598,25 +654,16 @@ impl Consumer {
     }
 }
 
-/// Naming convention for the dependency-canister-id env var: upper-snake
-/// `<NAME>_CANISTER_ID`. Matches how frontend build tooling (e.g. Vite
-/// with `VITE_*_CANISTER_ID`) and `ic-cdk` example projects typically
-/// read canister ids.
-fn dep_env_var_key(canister_name: &str) -> String {
-    format!("{}_CANISTER_ID", sanitize_env_key(canister_name))
-}
-
-/// Uppercases and replaces anything not matching `[A-Z0-9_]` with `_`.
-/// Keeps the output compatible with POSIX env-var naming rules, which is
-/// what every env reader we care about expects.
-fn sanitize_env_key(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            'a'..='z' => c.to_ascii_uppercase(),
-            'A'..='Z' | '0'..='9' | '_' => c,
-            _ => '_',
-        })
-        .collect()
+/// Naming convention for the dependency-canister-id env var:
+/// `PUBLIC_CANISTER_ID:<name>`. The name is kept in the manifest's
+/// original casing (lowercase in practice, by convention), and the key
+/// includes a literal colon separator.
+///
+/// This matches the convention consumed by the icp-cli asset canister's
+/// `ic_env` cookie (wasm >= 0.30.2) and by frontends reading
+/// `URLSearchParams.get("PUBLIC_CANISTER_ID:<name>")`.
+fn public_canister_id_key(canister_name: &str) -> String {
+    format!("{PUBLIC_CANISTER_ID_PREFIX}{canister_name}")
 }
 
 /// Topological sort of the `canisters` map on the `dependencies` edges.
