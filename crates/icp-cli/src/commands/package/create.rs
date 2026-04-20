@@ -2,378 +2,311 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context as _, anyhow};
 use clap::Args;
-use icp::InitArgs;
 use icp::context::{Context, EnvironmentSelection};
-use icp::manifest::ArgsFormat;
-use icp::prelude::PathBuf;
+use icp::prelude::{Path, PathBuf};
 use icp_packaging::{
     ArgFormat, Bundle, CanisterArg, CanisterEntry, CanisterKind, Manifest, Screenshot,
-    bundle::default_wasm_path,
+    ScreenshotFormFactor, bundle::default_wasm_path,
 };
+use serde::Deserialize;
 use tracing::info;
 
 use crate::options::EnvironmentOpt;
 
-/// Create an application bundle (.icp-app zip) from previously built canisters.
+/// Create an application bundle (.icp-app zip) from a build manifest JSON file.
 ///
-/// The canister wasms are pulled from the local build artifact store, which
-/// is populated by `icp build`. Run `icp build` for the same environment
-/// before running this command.
+/// The build manifest describes everything that goes into the bundle:
+/// application metadata, per-canister configuration (init/upgrade args,
+/// dependencies, env variables), screenshots, and asset directories. Its
+/// shape mirrors the runtime `manifest.json` that ends up inside the zip,
+/// with a handful of extra fields that only make sense at build time
+/// (`asset_dir`, optional `wasm`, screenshot `src` points at a file on
+/// disk).
+///
+/// Wasm bytes for each canister are resolved in this order:
+///   1. `canisters.<name>.wasm` in the build manifest, if set.
+///   2. Otherwise, the local build artifact store (populated by
+///      `icp build`). The `-e <environment>` flag selects the environment
+///      to read from.
+///
+/// See `docs/package-manifest.md` for a full example.
 #[derive(Debug, Args)]
 pub(crate) struct CreateArgs {
-    /// Human readable application name written into the manifest.
-    #[arg(long)]
-    pub(crate) name: String,
+    /// Path to the build manifest JSON file.
+    #[arg(long, short = 'm')]
+    pub(crate) manifest: PathBuf,
 
-    /// Optional application version string, written into the manifest.
-    #[arg(long)]
-    pub(crate) application_version: Option<String>,
-
-    /// Optional application description, written into the manifest.
-    #[arg(long)]
-    pub(crate) description: Option<String>,
-
-    /// Output file to write the bundle to.
+    /// Output path for the generated bundle zip.
     #[arg(long, short = 'o')]
     pub(crate) out: PathBuf,
 
-    /// Upgrade argument for a specific canister, in the form
-    /// `CANISTER=CANDID_TEXT`. May be specified multiple times.
-    ///
-    /// Example: `--upgrade-arg backend='(opt variant { Upgrade })'`
-    #[arg(long = "upgrade-arg", value_parser = parse_kv)]
-    pub(crate) upgrade_args: Vec<(String, String)>,
-
-    /// Declare that a canister depends on one or more other canisters, in
-    /// the form `CANISTER=DEP1,DEP2`. May be specified multiple times.
-    ///
-    /// Example: `--depends frontend=backend`
-    #[arg(long = "depends", value_parser = parse_kv)]
-    pub(crate) depends: Vec<(String, String)>,
-
-    /// Set an environment variable on a specific canister. Form:
-    /// `CANISTER=KEY=VALUE`. May be specified multiple times.
-    ///
-    /// If VALUE is omitted (i.e. `CANISTER=KEY=`), the variable is written
-    /// to the manifest as `null`, signalling to the installer that it must
-    /// prompt the user for a value at install time.
-    ///
-    /// The installer will also automatically inject `CANISTER_ID_<name>`
-    /// variables for every canister in the bundle, so those do not need to
-    /// be specified here.
-    ///
-    /// Example: `--env backend=LOG_LEVEL=debug`
-    /// Example: `--env backend=API_KEY=`   (prompted at install time)
-    #[arg(long = "env", value_parser = parse_env_triple)]
-    pub(crate) env: Vec<(String, String, Option<String>)>,
-
-    /// Attach a screenshot to the bundle.
-    ///
-    /// Form: `PATH[,form_factor=narrow|wide][,label=TEXT][,sizes=WxH]`.
-    /// The file at `PATH` on disk is read and packed under `screenshots/`
-    /// in the zip, and a matching entry is added to the manifest.
-    ///
-    /// Example: `--screenshot ./shots/hero.png,form_factor=wide,label=Home`
-    #[arg(long = "screenshot", value_parser = parse_screenshot_spec)]
-    pub(crate) screenshots: Vec<ScreenshotSpec>,
-
-    /// Attach an asset directory for an asset canister. Every file under
-    /// `DIR` is recursively packed into the bundle as part of the given
-    /// canister's payload. Marks the canister as `type: assets` in the
-    /// manifest.
-    ///
-    /// Form: `CANISTER=DIR`. May be specified multiple times (once per
-    /// asset canister).
-    ///
-    /// Example: `--asset-dir frontend=./frontend/dist`
-    #[arg(long = "asset-dir", value_parser = parse_kv)]
-    pub(crate) asset_dirs: Vec<(String, String)>,
-
-    /// Canister names to include. If empty, all canisters in the selected
-    /// environment are included.
-    pub(crate) canisters: Vec<String>,
-
+    /// Environment whose artifact store should be consulted when a
+    /// canister doesn't specify a `wasm` path in the manifest. Defaults
+    /// to the local environment.
     #[command(flatten)]
     pub(crate) environment: EnvironmentOpt,
 }
 
-fn parse_kv(s: &str) -> Result<(String, String), String> {
-    let (k, v) = s
-        .split_once('=')
-        .ok_or_else(|| "expected KEY=VALUE".to_string())?;
-    if k.is_empty() {
-        return Err("KEY must not be empty".to_string());
-    }
-    Ok((k.to_string(), v.to_string()))
+// --- Build-manifest schema -------------------------------------------------
+//
+// This mirrors `icp_packaging::Manifest` with a few additions:
+//   - manifest_version is optional (defaults to 1)
+//   - canisters.<name>.wasm: optional path to a wasm file on disk
+//   - canisters.<name>.asset_dir: optional path to a directory whose
+//     contents get packed as this canister's asset payload. Presence of
+//     this field implies `type: assets`.
+//   - screenshots[].src is interpreted as a path on disk; it gets rewritten
+//     to `screenshots/<basename>` inside the zip.
+//
+// Unknown fields are rejected so typos surface quickly.
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BuildManifest {
+    #[serde(default)]
+    manifest_version: Option<u32>,
+
+    name: String,
+
+    #[serde(default)]
+    application_version: Option<String>,
+
+    #[serde(default)]
+    description: Option<String>,
+
+    #[serde(default)]
+    screenshots: Vec<BuildScreenshot>,
+
+    canisters: BTreeMap<String, BuildCanister>,
 }
 
-/// Parses `CANISTER=KEY=VALUE` (or `CANISTER=KEY=` for a null value).
-fn parse_env_triple(s: &str) -> Result<(String, String, Option<String>), String> {
-    let (canister, rest) = s
-        .split_once('=')
-        .ok_or_else(|| "expected CANISTER=KEY=VALUE".to_string())?;
-    if canister.is_empty() {
-        return Err("CANISTER must not be empty".to_string());
-    }
-    let (key, value) = rest
-        .split_once('=')
-        .ok_or_else(|| "expected CANISTER=KEY=VALUE".to_string())?;
-    if key.is_empty() {
-        return Err("KEY must not be empty".to_string());
-    }
-    let value = if value.is_empty() {
-        None
-    } else {
-        Some(value.to_string())
-    };
-    Ok((canister.to_string(), key.to_string(), value))
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BuildCanister {
+    /// Optional: `backend` (default) or `assets`. Setting `asset_dir`
+    /// automatically promotes this to `assets`.
+    #[serde(default, rename = "type")]
+    kind: Option<CanisterKindSpec>,
+
+    /// Optional path to a wasm file on disk. Overrides the artifact store
+    /// lookup.
+    #[serde(default)]
+    wasm: Option<String>,
+
+    /// Optional path to a directory whose contents should be packed as
+    /// this canister's asset payload.
+    #[serde(default)]
+    asset_dir: Option<String>,
+
+    #[serde(default)]
+    dependencies: Vec<String>,
+
+    #[serde(default)]
+    env_variables: BTreeMap<String, Option<String>>,
+
+    #[serde(default)]
+    init_arg: Option<BuildCanisterArg>,
+
+    #[serde(default)]
+    upgrade_arg: Option<BuildCanisterArg>,
 }
 
-/// A CLI-level description of a screenshot to attach. Resolved at exec
-/// time into a [`Screenshot`] manifest entry plus the file bytes.
-#[derive(Clone, Debug)]
-pub(crate) struct ScreenshotSpec {
-    /// Source path on disk.
-    pub(crate) path: PathBuf,
-    /// Optional "narrow" / "wide" form factor.
-    pub(crate) form_factor: Option<String>,
-    /// Optional label.
-    pub(crate) label: Option<String>,
-    /// Optional sizes descriptor.
-    pub(crate) sizes: Option<String>,
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+enum CanisterKindSpec {
+    Backend,
+    Assets,
 }
 
-fn parse_screenshot_spec(s: &str) -> Result<ScreenshotSpec, String> {
-    // PATH[,k=v]*
-    let mut parts = s.split(',');
-    let path = parts
-        .next()
-        .ok_or_else(|| "empty screenshot spec".to_string())?
-        .trim();
-    if path.is_empty() {
-        return Err("screenshot PATH must not be empty".to_string());
-    }
-    let mut spec = ScreenshotSpec {
-        path: PathBuf::from(path),
-        form_factor: None,
-        label: None,
-        sizes: None,
-    };
-    for part in parts {
-        let (k, v) = part
-            .split_once('=')
-            .ok_or_else(|| format!("expected key=value in screenshot spec, got '{part}'"))?;
-        let k = k.trim();
-        let v = v.trim();
-        match k {
-            "form_factor" => {
-                if v != "narrow" && v != "wide" {
-                    return Err(format!(
-                        "form_factor must be 'narrow' or 'wide', got '{v}'"
-                    ));
-                }
-                spec.form_factor = Some(v.to_string());
-            }
-            "label" => spec.label = Some(v.to_string()),
-            "sizes" => spec.sizes = Some(v.to_string()),
-            other => {
-                return Err(format!(
-                    "unknown key '{other}' in screenshot spec (expected form_factor, label, sizes)"
-                ));
-            }
+impl From<CanisterKindSpec> for CanisterKind {
+    fn from(v: CanisterKindSpec) -> Self {
+        match v {
+            CanisterKindSpec::Backend => CanisterKind::Backend,
+            CanisterKindSpec::Assets => CanisterKind::Assets,
         }
     }
-    Ok(spec)
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BuildCanisterArg {
+    arg: String,
+    #[serde(default)]
+    format: Option<ArgFormatSpec>,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+enum ArgFormatSpec {
+    Candid,
+    Json,
+}
+
+impl From<ArgFormatSpec> for ArgFormat {
+    fn from(v: ArgFormatSpec) -> Self {
+        match v {
+            ArgFormatSpec::Candid => ArgFormat::Candid,
+            ArgFormatSpec::Json => ArgFormat::Json,
+        }
+    }
+}
+
+/// Screenshot entry in the build manifest. `src` is a path on disk; the
+/// builder reads the bytes and rewrites `src` to its in-zip location.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BuildScreenshot {
+    src: String,
+    #[serde(default)]
+    sizes: Option<String>,
+    #[serde(default, rename = "type")]
+    mime_type: Option<String>,
+    #[serde(default)]
+    form_factor: Option<ScreenshotFormFactorSpec>,
+    #[serde(default)]
+    label: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+enum ScreenshotFormFactorSpec {
+    Narrow,
+    Wide,
+}
+
+impl From<ScreenshotFormFactorSpec> for ScreenshotFormFactor {
+    fn from(v: ScreenshotFormFactorSpec) -> Self {
+        match v {
+            ScreenshotFormFactorSpec::Narrow => ScreenshotFormFactor::Narrow,
+            ScreenshotFormFactorSpec::Wide => ScreenshotFormFactor::Wide,
+        }
+    }
+}
+
+// --- Command entry point ---------------------------------------------------
+
 pub(crate) async fn exec(ctx: &Context, args: &CreateArgs) -> Result<(), anyhow::Error> {
-    let environment_selection: EnvironmentSelection = args.environment.clone().into();
-    let env = ctx.get_environment(&environment_selection).await?;
+    // 1. Load + parse the build manifest.
+    let manifest_bytes = std::fs::read(args.manifest.as_std_path())
+        .with_context(|| format!("failed to read build manifest '{}'", args.manifest))?;
+    let build: BuildManifest = serde_json::from_slice(&manifest_bytes)
+        .with_context(|| format!("failed to parse build manifest '{}'", args.manifest))?;
 
-    // Decide which canisters to include.
-    let canister_names: Vec<String> = if args.canisters.is_empty() {
-        env.canisters.keys().cloned().collect()
-    } else {
-        args.canisters.clone()
-    };
+    // All paths in the build manifest are resolved relative to the
+    // manifest file's own directory. This keeps the manifest portable —
+    // you can check it in next to the files it references.
+    let manifest_dir: PathBuf = args
+        .manifest
+        .parent()
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| PathBuf::from("."));
 
-    if canister_names.is_empty() {
+    if build.canisters.is_empty() {
         return Err(anyhow!(
-            "no canisters to package: environment '{}' has no canisters",
-            env.name
+            "build manifest '{}' declares no canisters",
+            args.manifest
         ));
     }
 
-    // Validate that every canister name in args is actually known.
-    for name in &canister_names {
-        if !env.canisters.contains_key(name) {
-            return Err(anyhow!(
-                "canister '{name}' is not part of environment '{}'",
-                env.name
-            ));
-        }
-    }
+    // 2. Load the environment lazily. We only need it when at least one
+    //    canister omits its `wasm` field. Wrap in an Option so we don't
+    //    fail if no project is set up and every canister specifies a wasm.
+    let need_artifact_store = build.canisters.values().any(|c| c.wasm.is_none());
+    let env_opt = if need_artifact_store {
+        let environment_selection: EnvironmentSelection = args.environment.clone().into();
+        Some(ctx.get_environment(&environment_selection).await?)
+    } else {
+        None
+    };
 
-    // Index --upgrade-arg and --depends flags by canister name.
-    let mut upgrade_args: BTreeMap<String, String> = BTreeMap::new();
-    for (k, v) in &args.upgrade_args {
-        upgrade_args.insert(k.clone(), v.clone());
-    }
-    let mut depends: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for (k, v) in &args.depends {
-        let list: Vec<String> = v
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(ToString::to_string)
-            .collect();
-        depends.insert(k.clone(), list);
-    }
-
-    // Index --env flags by canister name. Each canister ends up with a
-    // map of key -> Option<String> (None means "installer must prompt").
-    let mut env_vars: BTreeMap<String, BTreeMap<String, Option<String>>> = BTreeMap::new();
-    for (canister, key, value) in &args.env {
-        env_vars
-            .entry(canister.clone())
-            .or_default()
-            .insert(key.clone(), value.clone());
-    }
-
-    // Index --asset-dir flags by canister name.
-    let mut asset_dirs: BTreeMap<String, PathBuf> = BTreeMap::new();
-    for (canister, dir) in &args.asset_dirs {
-        if asset_dirs.contains_key(canister) {
-            return Err(anyhow!(
-                "--asset-dir specified more than once for canister '{canister}'"
-            ));
-        }
-        asset_dirs.insert(canister.clone(), PathBuf::from(dir));
-    }
-
-    // Build the manifest + wasm payload.
-    let mut manifest = Manifest::new(&args.name);
-    manifest.application_version = args.application_version.clone();
-    manifest.description = args.description.clone();
+    // 3. Build the output manifest + wasm/asset/screenshot maps.
+    let mut out_manifest = Manifest::new(&build.name);
+    out_manifest.manifest_version = build
+        .manifest_version
+        .unwrap_or(icp_packaging::MANIFEST_VERSION);
+    out_manifest.application_version = build.application_version.clone();
+    out_manifest.description = build.description.clone();
 
     let mut wasms: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    let mut assets: BTreeMap<String, BTreeMap<String, Vec<u8>>> = BTreeMap::new();
 
-    for name in &canister_names {
-        let (_path, canister) = env
-            .get_canister_info(name)
-            .map_err(|e| anyhow!("failed to resolve canister info: {e}"))?;
+    let canister_names: Vec<String> = build.canisters.keys().cloned().collect();
 
-        // Pull the built wasm out of the artifact store.
-        let wasm = ctx
-            .artifacts
-            .lookup(name)
-            .await
-            .with_context(|| format!("no build artifact for canister '{name}'; run `icp build` first"))?;
-
-        // Translate the per-canister init_args (if any) into a
-        // CanisterArg. We only support text args (candid or json-as-candid)
-        // — binary is not representable in the manifest format.
-        let init_arg = canister
-            .init_args
-            .as_ref()
-            .and_then(translate_init_arg);
-
-        // Translate --upgrade-arg (assumed candid text).
-        let upgrade_arg = upgrade_args.get(name).map(|s| CanisterArg {
-            arg: s.clone(),
-            format: ArgFormat::Candid,
-        });
-
-        // Collect dependencies for this canister.
-        let dependencies = depends.get(name).cloned().unwrap_or_default();
-
-        // Validate all declared dependencies are part of the bundle.
-        for dep in &dependencies {
+    for (name, canister) in &build.canisters {
+        // Dependencies must refer to canisters in the same manifest.
+        for dep in &canister.dependencies {
             if !canister_names.contains(dep) {
                 return Err(anyhow!(
-                    "canister '{name}' depends on '{dep}' which is not included in the bundle"
+                    "canister '{name}' depends on '{dep}' which is not in the manifest"
                 ));
             }
         }
 
-        // Collect env vars for this canister.
-        let env_variables = env_vars.get(name).cloned().unwrap_or_default();
+        // Resolve the wasm bytes.
+        let wasm = match canister.wasm.as_deref() {
+            Some(rel_path) => {
+                let abs = resolve_relative(&manifest_dir, rel_path);
+                std::fs::read(abs.as_std_path())
+                    .with_context(|| format!("failed to read wasm for canister '{name}' at '{abs}'"))?
+            }
+            None => {
+                let env = env_opt
+                    .as_ref()
+                    .expect("need_artifact_store is true when any canister omits wasm");
+                if !env.canisters.contains_key(name) {
+                    return Err(anyhow!(
+                        "canister '{name}' has no `wasm` in the manifest and is not \
+                         part of environment '{}'",
+                        env.name
+                    ));
+                }
+                ctx.artifacts.lookup(name).await.with_context(|| {
+                    format!("no build artifact for canister '{name}'; run `icp build` first")
+                })?
+            }
+        };
 
-        // A canister becomes `type: assets` if the user supplied
-        // `--asset-dir` for it. Otherwise it stays `backend`.
-        let kind = if asset_dirs.contains_key(name) {
+        // Resolve asset files, if any.
+        let kind = if let Some(dir) = canister.asset_dir.as_deref() {
+            let abs = resolve_relative(&manifest_dir, dir);
+            let files = collect_asset_dir(&abs).with_context(|| {
+                format!("failed to collect assets for canister '{name}' from '{abs}'")
+            })?;
+            assets.insert(name.clone(), files);
             CanisterKind::Assets
         } else {
-            CanisterKind::Backend
+            canister.kind.map(CanisterKind::from).unwrap_or_default()
         };
+
+        // Translate init/upgrade args.
+        let init_arg = canister.init_arg.as_ref().map(to_canister_arg);
+        let upgrade_arg = canister.upgrade_arg.as_ref().map(to_canister_arg);
 
         let entry = CanisterEntry {
             kind,
             path: default_wasm_path(name),
-            dependencies,
-            env_variables,
+            dependencies: canister.dependencies.clone(),
+            env_variables: canister.env_variables.clone(),
             init_arg,
             upgrade_arg,
         };
-
-        manifest.canisters.insert(name.clone(), entry);
+        out_manifest.canisters.insert(name.clone(), entry);
         wasms.insert(name.clone(), wasm);
     }
 
-    // Reject unknown --upgrade-arg / --depends / --env targets.
-    for name in upgrade_args.keys() {
-        if !manifest.canisters.contains_key(name) {
-            return Err(anyhow!(
-                "--upgrade-arg for unknown canister '{name}' (not in the bundle)"
-            ));
-        }
-    }
-    for name in depends.keys() {
-        if !manifest.canisters.contains_key(name) {
-            return Err(anyhow!(
-                "--depends for unknown canister '{name}' (not in the bundle)"
-            ));
-        }
-    }
-    for name in env_vars.keys() {
-        if !manifest.canisters.contains_key(name) {
-            return Err(anyhow!(
-                "--env for unknown canister '{name}' (not in the bundle)"
-            ));
-        }
-    }
-    for name in asset_dirs.keys() {
-        if !manifest.canisters.contains_key(name) {
-            return Err(anyhow!(
-                "--asset-dir for unknown canister '{name}' (not in the bundle)"
-            ));
-        }
-    }
-
-    // Walk each asset directory and collect (relative_path -> bytes).
-    // Relative paths use forward slashes regardless of host OS because
-    // they are stored that way inside the zip and consumed by asset
-    // canisters.
-    let mut assets: BTreeMap<String, BTreeMap<String, Vec<u8>>> = BTreeMap::new();
-    for (canister, dir) in &asset_dirs {
-        let files = collect_asset_dir(dir)
-            .with_context(|| format!("failed to collect assets for canister '{canister}' from '{dir}'"))?;
-        assets.insert(canister.clone(), files);
-    }
-
-    // Read and attach screenshots. Each file on disk is placed under
-    // `screenshots/<basename>` inside the zip. If multiple screenshots
-    // share the same basename we disambiguate by appending an index.
+    // 4. Read and attach screenshots. Source path -> bytes; the in-zip
+    //    path is always `screenshots/<basename>` with an auto-disambiguator
+    //    on collisions.
     let mut screenshot_bytes: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     let mut used_names: std::collections::BTreeSet<String> = Default::default();
-    for spec in &args.screenshots {
-        let bytes = std::fs::read(spec.path.as_std_path())
-            .with_context(|| format!("failed to read screenshot '{}'", spec.path))?;
+    for spec in &build.screenshots {
+        let abs = resolve_relative(&manifest_dir, &spec.src);
+        let bytes = std::fs::read(abs.as_std_path())
+            .with_context(|| format!("failed to read screenshot '{abs}'"))?;
 
-        let file_name = spec
-            .path
+        let file_name = abs
             .file_name()
-            .ok_or_else(|| anyhow!("screenshot path '{}' has no file name", spec.path))?;
+            .ok_or_else(|| anyhow!("screenshot path '{abs}' has no file name"))?;
         let mut candidate = format!("screenshots/{file_name}");
         let mut n: u32 = 1;
         while used_names.contains(&candidate) {
@@ -382,31 +315,22 @@ pub(crate) async fn exec(ctx: &Context, args: &CreateArgs) -> Result<(), anyhow:
         }
         used_names.insert(candidate.clone());
 
-        let form_factor = spec
-            .form_factor
-            .as_deref()
-            .map(|v| match v {
-                "narrow" => icp_packaging::ScreenshotFormFactor::Narrow,
-                "wide" => icp_packaging::ScreenshotFormFactor::Wide,
-                _ => unreachable!("validated by parse_screenshot_spec"),
-            });
+        let mime_type = spec.mime_type.clone().or_else(|| guess_mime_type(&abs));
 
-        let mime_type = guess_mime_type(&spec.path);
-
-        manifest.screenshots.push(Screenshot {
+        out_manifest.screenshots.push(Screenshot {
             src: candidate.clone(),
             sizes: spec.sizes.clone(),
             mime_type,
-            form_factor,
+            form_factor: spec.form_factor.map(ScreenshotFormFactor::from),
             label: spec.label.clone(),
         });
         screenshot_bytes.insert(candidate, bytes);
     }
 
-    // Write the zip.
+    // 5. Write the zip.
     let total_assets: usize = assets.values().map(BTreeMap::len).sum();
     Bundle::create(
-        manifest,
+        out_manifest,
         &wasms,
         &screenshot_bytes,
         &assets,
@@ -418,19 +342,36 @@ pub(crate) async fn exec(ctx: &Context, args: &CreateArgs) -> Result<(), anyhow:
         "Bundle written to {} ({} canister(s), {} screenshot(s), {} asset file(s))",
         args.out,
         canister_names.len(),
-        args.screenshots.len(),
+        build.screenshots.len(),
         total_assets,
     );
 
     Ok(())
 }
 
+// --- Helpers ---------------------------------------------------------------
+
+fn to_canister_arg(spec: &BuildCanisterArg) -> CanisterArg {
+    CanisterArg {
+        arg: spec.arg.clone(),
+        format: spec.format.map(ArgFormat::from).unwrap_or_default(),
+    }
+}
+
+/// Resolve a path that appeared in the build manifest. Absolute paths are
+/// kept as-is; relative ones are joined with the manifest's directory.
+fn resolve_relative(manifest_dir: &Path, rel: &str) -> PathBuf {
+    let p = PathBuf::from(rel);
+    if p.is_absolute() {
+        p
+    } else {
+        manifest_dir.join(p)
+    }
+}
+
 /// Recursively walk `dir` and return a map of `<relative_path> -> <bytes>`.
-///
-/// Paths use forward slashes regardless of host OS. Symlinks are followed
-/// by `std::fs::read`; cycles would therefore read until I/O errors, but
-/// for an MVP demo that is acceptable.
-fn collect_asset_dir(dir: &icp::prelude::Path) -> Result<BTreeMap<String, Vec<u8>>, anyhow::Error> {
+/// Paths use forward slashes regardless of host OS.
+fn collect_asset_dir(dir: &Path) -> Result<BTreeMap<String, Vec<u8>>, anyhow::Error> {
     if !dir.exists() {
         return Err(anyhow!("asset directory '{dir}' does not exist"));
     }
@@ -454,7 +395,6 @@ fn collect_asset_dir(dir: &icp::prelude::Path) -> Result<BTreeMap<String, Vec<u8
                 stack.push(path);
                 continue;
             }
-            // Compute the path relative to `dir`, using forward slashes.
             let rel = path
                 .strip_prefix(dir)
                 .map_err(|e| anyhow!("failed to compute relative path for '{path}': {e}"))?;
@@ -467,9 +407,9 @@ fn collect_asset_dir(dir: &icp::prelude::Path) -> Result<BTreeMap<String, Vec<u8
     Ok(out)
 }
 
-/// Very small MIME-type guesser for screenshots. We only need to cover the
-/// handful of formats users will reasonably drop in here.
-fn guess_mime_type(path: &icp::prelude::Path) -> Option<String> {
+/// Very small MIME-type guesser for screenshots. Only covers formats
+/// users will reasonably drop in here.
+fn guess_mime_type(path: &Path) -> Option<String> {
     let ext = path.extension()?.to_ascii_lowercase();
     Some(
         match ext.as_str() {
@@ -482,28 +422,4 @@ fn guess_mime_type(path: &icp::prelude::Path) -> Option<String> {
         }
         .to_string(),
     )
-}
-
-/// Map `icp::InitArgs` to a `CanisterArg` suitable for the manifest file.
-///
-/// `InitArgs::Binary` is intentionally skipped: the manifest format stores
-/// args as text only. This mirrors the MVP scope — binary init args are a
-/// rare case and can be added later by encoding as hex or handling them
-/// outside the bundle.
-fn translate_init_arg(args: &InitArgs) -> Option<CanisterArg> {
-    match args {
-        InitArgs::Text { content, format } => {
-            let format = match format {
-                ArgsFormat::Candid => ArgFormat::Candid,
-                // No json format in the current InitArgs surface; treat
-                // hex and bin as candid text (best effort) or drop.
-                ArgsFormat::Hex | ArgsFormat::Bin => return None,
-            };
-            Some(CanisterArg {
-                arg: content.clone(),
-                format,
-            })
-        }
-        InitArgs::Binary(_) => None,
-    }
 }
