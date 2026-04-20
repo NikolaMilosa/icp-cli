@@ -36,9 +36,11 @@
 //! the main `icp` crate's facilities) to perform step-by-step install.
 
 pub mod bundle;
+pub mod consumer;
 pub mod manifest;
 
 pub use bundle::{Bundle, CreateError, OpenError};
+pub use consumer::{ConsumeError, Consumer, InstallArg, InstallMode, InstallStep};
 pub use manifest::{
     ArgFormat, CanisterArg, CanisterEntry, CanisterKind, Manifest, Screenshot,
     ScreenshotFormFactor, MANIFEST_VERSION,

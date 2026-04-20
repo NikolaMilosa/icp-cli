@@ -268,7 +268,7 @@ impl Bundle {
         Ok(())
     }
 
-    /// Open an existing bundle.
+    /// Open an existing bundle from a file on disk.
     ///
     /// Reads the manifest, decompresses every canister's wasm, and performs
     /// a small amount of structural validation:
@@ -278,7 +278,19 @@ impl Bundle {
         let file = File::open(path).context(OpenInputSnafu {
             path: path.to_path_buf(),
         })?;
-        let mut archive = ZipArchive::new(file).context(ReadArchiveSnafu)?;
+        Self::open_reader(file)
+    }
+
+    /// Open an existing bundle from in-memory bytes.
+    ///
+    /// Useful on the consumer side when the bundle arrives as a byte blob,
+    /// e.g. as multipart form data in an HTTP request body.
+    pub fn open_bytes(bytes: &[u8]) -> Result<Self, OpenError> {
+        Self::open_reader(std::io::Cursor::new(bytes.to_vec()))
+    }
+
+    fn open_reader<R: Read + std::io::Seek>(reader: R) -> Result<Self, OpenError> {
+        let mut archive = ZipArchive::new(reader).context(ReadArchiveSnafu)?;
 
         // Read manifest.
         let manifest: Manifest = {
