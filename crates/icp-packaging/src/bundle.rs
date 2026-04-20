@@ -31,6 +31,9 @@ use crate::manifest::{CanisterEntry, Manifest};
 pub const MANIFEST_FILE: &str = "manifest.json";
 /// Directory prefix for canister wasm entries inside the bundle.
 pub const CANISTERS_DIR: &str = "canisters";
+/// Directory prefix for asset-canister static files. Layout inside the zip
+/// is `assets/<canister_name>/<relative_path>`, matching `packaging_design.md`.
+pub const ASSETS_DIR: &str = "assets";
 
 /// Errors that can occur while building a bundle.
 #[derive(Debug, Snafu)]
@@ -85,6 +88,24 @@ pub enum CreateError {
 
     #[snafu(display("screenshot src '{src}' must not be empty"))]
     EmptyScreenshotSrc { src: String },
+
+    #[snafu(display(
+        "assets were provided for canister '{canister}' which is not in the manifest"
+    ))]
+    AssetsForUnknownCanister { canister: String },
+
+    #[snafu(display(
+        "assets were provided for canister '{canister}' but its type is not 'assets'"
+    ))]
+    AssetsForNonAssetCanister { canister: String },
+
+    #[snafu(display("asset path '{path}' for canister '{canister}' must not be empty"))]
+    EmptyAssetPath { canister: String, path: String },
+
+    #[snafu(display(
+        "asset path '{path}' for canister '{canister}' must be relative (no leading '/')"
+    ))]
+    AbsoluteAssetPath { canister: String, path: String },
 }
 
 /// Errors that can occur while reading a bundle.
@@ -134,10 +155,10 @@ pub enum OpenError {
 
 /// In-memory representation of an opened bundle.
 ///
-/// When a bundle is opened via [`Bundle::open`] we eagerly load every wasm
-/// and screenshot into memory. Bundles are expected to be small-ish (a
-/// handful of wasms each a few MB, plus a few screenshots) so this keeps
-/// the API ergonomic for the MVP.
+/// When a bundle is opened via [`Bundle::open`] we eagerly load every
+/// wasm, screenshot and asset file into memory. Bundles are expected to
+/// be small-ish so this keeps the API ergonomic for the MVP. Very large
+/// asset payloads may exhaust memory — a streaming variant is future work.
 #[derive(Debug)]
 pub struct Bundle {
     pub manifest: Manifest,
@@ -147,6 +168,13 @@ pub struct Bundle {
     /// also the path inside the zip). Empty if the manifest declares no
     /// screenshots.
     pub screenshots: BTreeMap<String, Vec<u8>>,
+    /// Static files for asset canisters, keyed by canister name and then
+    /// by the path relative to the canister's asset root. Corresponds to
+    /// the `assets/<canister>/<path>` entries in the zip.
+    ///
+    /// For a backend installer this is the payload to push to each
+    /// asset canister after `install_code` has completed.
+    pub assets: BTreeMap<String, BTreeMap<String, Vec<u8>>>,
 }
 
 impl Bundle {
@@ -161,12 +189,18 @@ impl Bundle {
     ///   [`crate::manifest::Screenshot`] to the raw image bytes. Keys must
     ///   match exactly the `src` values in `manifest.screenshots`. Pass an
     ///   empty map if the manifest declares no screenshots.
+    /// - `assets` maps canister name → (relative path → bytes) for every
+    ///   asset canister in the manifest. Paths are stored verbatim under
+    ///   `assets/<canister>/<relative_path>` in the zip. Only canisters of
+    ///   `type: assets` may have entries here. Pass an empty map if no
+    ///   assets need to be bundled.
     /// - `out` is the path to the zip file to produce. Any existing file at
     ///   that path will be overwritten.
     pub fn create(
         mut manifest: Manifest,
         wasms: &BTreeMap<String, Vec<u8>>,
         screenshots: &BTreeMap<String, Vec<u8>>,
+        assets: &BTreeMap<String, BTreeMap<String, Vec<u8>>>,
         out: &Path,
     ) -> Result<(), CreateError> {
         // Basic sanity: every canister in the manifest has wasm, and vice versa.
@@ -205,6 +239,38 @@ impl Bundle {
         for src in screenshots.keys() {
             if !manifest.screenshots.iter().any(|s| &s.src == src) {
                 return UnknownScreenshotSnafu { src: src.clone() }.fail();
+            }
+        }
+
+        // Asset files must match canisters in the manifest, and those
+        // canisters must be asset canisters.
+        for (canister, files) in assets {
+            let entry = manifest.canisters.get(canister).ok_or_else(|| {
+                CreateError::AssetsForUnknownCanister {
+                    canister: canister.clone(),
+                }
+            })?;
+            if entry.kind != crate::manifest::CanisterKind::Assets {
+                return AssetsForNonAssetCanisterSnafu {
+                    canister: canister.clone(),
+                }
+                .fail();
+            }
+            for path in files.keys() {
+                if path.is_empty() {
+                    return EmptyAssetPathSnafu {
+                        canister: canister.clone(),
+                        path: path.clone(),
+                    }
+                    .fail();
+                }
+                if path.starts_with('/') {
+                    return AbsoluteAssetPathSnafu {
+                        canister: canister.clone(),
+                        path: path.clone(),
+                    }
+                    .fail();
+                }
             }
         }
 
@@ -262,6 +328,20 @@ impl Bundle {
             zip.write_all(bytes).context(WriteBytesSnafu {
                 entry: shot.src.clone(),
             })?;
+        }
+
+        // assets/<canister>/<relative_path>
+        for (canister, files) in assets {
+            for (rel_path, bytes) in files {
+                let zip_entry_name = format!("{ASSETS_DIR}/{canister}/{rel_path}");
+                zip.start_file(&zip_entry_name, options)
+                    .context(WriteEntrySnafu {
+                        entry: zip_entry_name.clone(),
+                    })?;
+                zip.write_all(bytes).context(WriteBytesSnafu {
+                    entry: zip_entry_name,
+                })?;
+            }
         }
 
         zip.finish().context(FinishArchiveSnafu)?;
@@ -345,10 +425,58 @@ impl Bundle {
             screenshots.insert(shot.src.clone(), buf);
         }
 
+        // Read asset files. We enumerate zip entries directly rather than
+        // driving this from the manifest — the manifest does not list
+        // individual asset files. Entries under `assets/<canister>/...`
+        // whose canister exists in the manifest are kept; everything else
+        // is silently ignored (a future strict mode could reject these).
+        let mut assets: BTreeMap<String, BTreeMap<String, Vec<u8>>> = BTreeMap::new();
+        let asset_prefix = format!("{ASSETS_DIR}/");
+        let entry_names: Vec<String> = (0..archive.len())
+            .filter_map(|i| archive.by_index(i).ok().map(|f| f.name().to_string()))
+            .collect();
+        for entry_name in entry_names {
+            if !entry_name.starts_with(&asset_prefix) {
+                continue;
+            }
+            // Strip "assets/" prefix.
+            let rest = &entry_name[asset_prefix.len()..];
+            // Directory entries (end with '/') are not useful to us.
+            if rest.is_empty() || rest.ends_with('/') {
+                continue;
+            }
+            // Split into <canister>/<rel_path>.
+            let Some((canister, rel_path)) = rest.split_once('/') else {
+                // Entry sits directly under `assets/` with no canister
+                // subdir — skip it, it's not addressable.
+                continue;
+            };
+            if rel_path.is_empty() {
+                continue;
+            }
+            if !manifest.canisters.contains_key(canister) {
+                continue;
+            }
+
+            let mut zentry = archive.by_name(&entry_name).context(ReadEntrySnafu {
+                entry: entry_name.clone(),
+            })?;
+            let mut buf = Vec::new();
+            zentry.read_to_end(&mut buf).context(ReadBytesSnafu {
+                entry: entry_name.clone(),
+            })?;
+
+            assets
+                .entry(canister.to_string())
+                .or_default()
+                .insert(rel_path.to_string(), buf);
+        }
+
         Ok(Bundle {
             manifest,
             wasms,
             screenshots,
+            assets,
         })
     }
 }

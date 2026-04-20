@@ -95,6 +95,27 @@ pub enum ConsumeError {
 
     #[snafu(display("manifest has a dependency cycle involving '{canister}'"))]
     DependencyCycle { canister: String },
+
+    #[snafu(display("canister '{canister}' init/upgrade arg is not valid candid"))]
+    CandidParse {
+        canister: String,
+        source: candid_parser::Error,
+    },
+
+    #[snafu(display("canister '{canister}' init/upgrade arg failed to encode to candid bytes"))]
+    CandidEncode {
+        canister: String,
+        source: candid::Error,
+    },
+
+    #[snafu(display(
+        "canister '{canister}' has a json-format arg; encoding JSON args requires the \
+         canister's candid service signature and is not supported by this crate"
+    ))]
+    JsonArgUnsupported { canister: String },
+
+    #[snafu(display("canister '{canister}' asset '{path}' is not part of the bundle"))]
+    UnknownAsset { canister: String, path: String },
 }
 
 /// Which install flavor should be performed for a given canister.
@@ -128,8 +149,18 @@ pub struct InstallStep {
     pub canister_id: String,
     /// Raw wasm bytes to install.
     pub wasm: Vec<u8>,
-    /// Install argument (init or upgrade), ready for the management canister.
-    pub arg: Option<InstallArg>,
+    /// Install argument (init or upgrade), already encoded to the bytes
+    /// the management canister expects.
+    ///
+    /// For candid-format args the text from the manifest is parsed with
+    /// `candid_parser` and re-encoded via `IDLArgs::to_bytes()`. JSON-
+    /// format args are rejected at plan time (see [`ConsumeError`]).
+    ///
+    /// If the caller wants the original text (e.g. for logging), see
+    /// [`InstallStep::raw_arg`].
+    pub arg: Option<Vec<u8>>,
+    /// Original textual form of the arg, preserved for logging / debugging.
+    pub raw_arg: Option<InstallArg>,
     /// Whether this should be treated as a first-time install or an upgrade.
     pub mode: InstallMode,
     /// Final environment variable map the caller should apply via
@@ -140,9 +171,9 @@ pub struct InstallStep {
 
 /// Textual install argument carried through from the manifest.
 ///
-/// For the MVP we do not decode the candid/json text into bytes — that
-/// requires knowing the canister's candid service signature and is left
-/// to the installer. This matches the MVP scope of the builder side.
+/// This is kept around alongside the pre-encoded bytes in
+/// [`InstallStep`] so that callers that want to log the arg in a human
+/// readable form still can.
 #[derive(Clone, Debug)]
 pub struct InstallArg {
     pub arg: String,
@@ -154,6 +185,40 @@ impl From<&CanisterArg> for InstallArg {
         Self {
             arg: v.arg.clone(),
             format: v.format,
+        }
+    }
+}
+
+impl InstallArg {
+    /// Encode this argument to the raw bytes the IC management canister
+    /// accepts in `install_code`.
+    ///
+    ///  - [`ArgFormat::Candid`]: parsed with `candid_parser::parse_idl_args`
+    ///    and encoded via `IDLArgs::to_bytes`. Does not require a `.did`
+    ///    file — the IC will type-check the resulting bytes against the
+    ///    canister's init signature on install.
+    ///  - [`ArgFormat::Json`]: unsupported without the canister's candid
+    ///    service signature; returns [`ConsumeError::JsonArgUnsupported`].
+    pub fn to_bytes(&self, canister: &str) -> Result<Vec<u8>, ConsumeError> {
+        match self.format {
+            ArgFormat::Candid => {
+                let parsed = candid_parser::parse_idl_args(self.arg.trim()).map_err(|source| {
+                    ConsumeError::CandidParse {
+                        canister: canister.to_string(),
+                        source,
+                    }
+                })?;
+                parsed
+                    .to_bytes()
+                    .map_err(|source| ConsumeError::CandidEncode {
+                        canister: canister.to_string(),
+                        source,
+                    })
+            }
+            ArgFormat::Json => JsonArgUnsupportedSnafu {
+                canister: canister.to_string(),
+            }
+            .fail(),
         }
     }
 }
@@ -261,6 +326,77 @@ impl Consumer {
     /// populate a listing page before or after install.
     pub fn screenshots(&self) -> &BTreeMap<String, Vec<u8>> {
         &self.bundle.screenshots
+    }
+
+    // --- Assets --------------------------------------------------------
+
+    /// Names of canisters that carry bundled asset files.
+    ///
+    /// Only canisters whose manifest type is `assets` *and* which actually
+    /// have at least one file are listed. A caller iterating this list
+    /// can decide, per canister, whether to push to the asset canister.
+    pub fn canisters_with_assets(&self) -> Vec<String> {
+        self.bundle
+            .assets
+            .iter()
+            .filter(|(_, files)| !files.is_empty())
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
+    /// List the relative paths of every asset file bundled for a given
+    /// canister. Returns an empty slice when the canister has no assets.
+    ///
+    /// The returned paths are exactly the keys a caller should use when
+    /// pushing content to the asset canister (typically they form the
+    /// asset URL, e.g. `index.html`, `static/logo.png`).
+    pub fn asset_paths(&self, canister: &str) -> Result<Vec<String>, ConsumeError> {
+        // Validate the canister exists even if it has no assets, so the
+        // caller gets a clear error for typos.
+        self.canister(canister)?;
+        Ok(self
+            .bundle
+            .assets
+            .get(canister)
+            .map(|files| files.keys().cloned().collect())
+            .unwrap_or_default())
+    }
+
+    /// Fetch the raw bytes for a single asset file.
+    ///
+    /// The caller is expected to set an appropriate `Content-Type` and
+    /// push this to the asset canister using the `identity` content
+    /// encoding (per `packaging_design.md`), optionally also gzipping for
+    /// a `gzip` content-encoding variant.
+    pub fn asset_bytes(&self, canister: &str, path: &str) -> Result<&[u8], ConsumeError> {
+        self.canister(canister)?;
+        self.bundle
+            .assets
+            .get(canister)
+            .and_then(|files| files.get(path))
+            .map(Vec::as_slice)
+            .ok_or_else(|| ConsumeError::UnknownAsset {
+                canister: canister.to_string(),
+                path: path.to_string(),
+            })
+    }
+
+    /// Return every asset file for a canister as a map of
+    /// `relative_path -> bytes`. Convenient when the caller wants to
+    /// stream everything to the asset canister in a batch.
+    ///
+    /// Returns an empty map if the canister has no bundled assets.
+    pub fn all_assets_for(
+        &self,
+        canister: &str,
+    ) -> Result<&BTreeMap<String, Vec<u8>>, ConsumeError> {
+        self.canister(canister)?;
+        static EMPTY: std::sync::OnceLock<BTreeMap<String, Vec<u8>>> = std::sync::OnceLock::new();
+        Ok(self
+            .bundle
+            .assets
+            .get(canister)
+            .unwrap_or_else(|| EMPTY.get_or_init(BTreeMap::new)))
     }
 
     /// Which env-var keys the manifest declared as `null` for a canister.
@@ -441,17 +577,18 @@ impl Consumer {
 
             // MVP: we always treat a bundle application as a fresh install.
             // The `mode` field is here so a future "upgrade" code path can
-            // be added without breaking the public API.
-            let (mode, arg) = (
-                InstallMode::Install,
-                entry.init_arg.as_ref().map(InstallArg::from),
-            );
+            // be added without breaking the public API. For an install we
+            // use init_arg; an upgrade would use upgrade_arg.
+            let mode = InstallMode::Install;
+            let raw_arg = entry.init_arg.as_ref().map(InstallArg::from);
+            let arg = raw_arg.as_ref().map(|a| a.to_bytes(name)).transpose()?;
 
             plan.push(InstallStep {
                 canister_name: name.clone(),
                 canister_id,
                 wasm,
                 arg,
+                raw_arg,
                 mode,
                 env_variables,
             });

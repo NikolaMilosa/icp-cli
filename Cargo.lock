@@ -3548,6 +3548,8 @@ dependencies = [
 name = "icp-packaging"
 version = "0.2.3"
 dependencies = [
+ "candid",
+ "candid_parser",
  "flate2",
  "serde",
  "serde_json",

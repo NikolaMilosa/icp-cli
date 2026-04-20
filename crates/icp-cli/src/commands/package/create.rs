@@ -77,6 +77,18 @@ pub(crate) struct CreateArgs {
     #[arg(long = "screenshot", value_parser = parse_screenshot_spec)]
     pub(crate) screenshots: Vec<ScreenshotSpec>,
 
+    /// Attach an asset directory for an asset canister. Every file under
+    /// `DIR` is recursively packed into the bundle as part of the given
+    /// canister's payload. Marks the canister as `type: assets` in the
+    /// manifest.
+    ///
+    /// Form: `CANISTER=DIR`. May be specified multiple times (once per
+    /// asset canister).
+    ///
+    /// Example: `--asset-dir frontend=./frontend/dist`
+    #[arg(long = "asset-dir", value_parser = parse_kv)]
+    pub(crate) asset_dirs: Vec<(String, String)>,
+
     /// Canister names to include. If empty, all canisters in the selected
     /// environment are included.
     pub(crate) canisters: Vec<String>,
@@ -228,6 +240,17 @@ pub(crate) async fn exec(ctx: &Context, args: &CreateArgs) -> Result<(), anyhow:
             .insert(key.clone(), value.clone());
     }
 
+    // Index --asset-dir flags by canister name.
+    let mut asset_dirs: BTreeMap<String, PathBuf> = BTreeMap::new();
+    for (canister, dir) in &args.asset_dirs {
+        if asset_dirs.contains_key(canister) {
+            return Err(anyhow!(
+                "--asset-dir specified more than once for canister '{canister}'"
+            ));
+        }
+        asset_dirs.insert(canister.clone(), PathBuf::from(dir));
+    }
+
     // Build the manifest + wasm payload.
     let mut manifest = Manifest::new(&args.name);
     manifest.application_version = args.application_version.clone();
@@ -276,8 +299,16 @@ pub(crate) async fn exec(ctx: &Context, args: &CreateArgs) -> Result<(), anyhow:
         // Collect env vars for this canister.
         let env_variables = env_vars.get(name).cloned().unwrap_or_default();
 
+        // A canister becomes `type: assets` if the user supplied
+        // `--asset-dir` for it. Otherwise it stays `backend`.
+        let kind = if asset_dirs.contains_key(name) {
+            CanisterKind::Assets
+        } else {
+            CanisterKind::Backend
+        };
+
         let entry = CanisterEntry {
-            kind: CanisterKind::Backend,
+            kind,
             path: default_wasm_path(name),
             dependencies,
             env_variables,
@@ -310,6 +341,24 @@ pub(crate) async fn exec(ctx: &Context, args: &CreateArgs) -> Result<(), anyhow:
                 "--env for unknown canister '{name}' (not in the bundle)"
             ));
         }
+    }
+    for name in asset_dirs.keys() {
+        if !manifest.canisters.contains_key(name) {
+            return Err(anyhow!(
+                "--asset-dir for unknown canister '{name}' (not in the bundle)"
+            ));
+        }
+    }
+
+    // Walk each asset directory and collect (relative_path -> bytes).
+    // Relative paths use forward slashes regardless of host OS because
+    // they are stored that way inside the zip and consumed by asset
+    // canisters.
+    let mut assets: BTreeMap<String, BTreeMap<String, Vec<u8>>> = BTreeMap::new();
+    for (canister, dir) in &asset_dirs {
+        let files = collect_asset_dir(dir)
+            .with_context(|| format!("failed to collect assets for canister '{canister}' from '{dir}'"))?;
+        assets.insert(canister.clone(), files);
     }
 
     // Read and attach screenshots. Each file on disk is placed under
@@ -355,22 +404,67 @@ pub(crate) async fn exec(ctx: &Context, args: &CreateArgs) -> Result<(), anyhow:
     }
 
     // Write the zip.
+    let total_assets: usize = assets.values().map(BTreeMap::len).sum();
     Bundle::create(
         manifest,
         &wasms,
         &screenshot_bytes,
+        &assets,
         args.out.as_std_path(),
     )
     .context("failed to create bundle")?;
 
     info!(
-        "Bundle written to {} ({} canister(s), {} screenshot(s))",
+        "Bundle written to {} ({} canister(s), {} screenshot(s), {} asset file(s))",
         args.out,
         canister_names.len(),
         args.screenshots.len(),
+        total_assets,
     );
 
     Ok(())
+}
+
+/// Recursively walk `dir` and return a map of `<relative_path> -> <bytes>`.
+///
+/// Paths use forward slashes regardless of host OS. Symlinks are followed
+/// by `std::fs::read`; cycles would therefore read until I/O errors, but
+/// for an MVP demo that is acceptable.
+fn collect_asset_dir(dir: &icp::prelude::Path) -> Result<BTreeMap<String, Vec<u8>>, anyhow::Error> {
+    if !dir.exists() {
+        return Err(anyhow!("asset directory '{dir}' does not exist"));
+    }
+    if !dir.is_dir() {
+        return Err(anyhow!("asset path '{dir}' is not a directory"));
+    }
+
+    let mut out: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    let mut stack: Vec<PathBuf> = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let iter = std::fs::read_dir(current.as_std_path())
+            .with_context(|| format!("failed to read directory '{current}'"))?;
+        for entry in iter {
+            let entry = entry.with_context(|| format!("failed to read entry in '{current}'"))?;
+            let path = PathBuf::from_path_buf(entry.path())
+                .map_err(|p| anyhow!("non-utf8 path in asset dir: {}", p.display()))?;
+            let file_type = entry
+                .file_type()
+                .with_context(|| format!("failed to stat '{path}'"))?;
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            // Compute the path relative to `dir`, using forward slashes.
+            let rel = path
+                .strip_prefix(dir)
+                .map_err(|e| anyhow!("failed to compute relative path for '{path}': {e}"))?;
+            let rel_str = rel.as_str().replace('\\', "/");
+            let bytes = std::fs::read(path.as_std_path())
+                .with_context(|| format!("failed to read asset file '{path}'"))?;
+            out.insert(rel_str, bytes);
+        }
+    }
+    Ok(out)
 }
 
 /// Very small MIME-type guesser for screenshots. We only need to cover the
