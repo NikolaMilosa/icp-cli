@@ -51,8 +51,12 @@
 //! | Name                | Value                                            |
 //! |---------------------|--------------------------------------------------|
 //! | `__META_NAME`       | name of *this* canister (manifest key)           |
-//! | `__META_DESCRIPTION`| `Manifest.description` (empty string if absent)  |
 //! | `__META_PROJECT`    | `Manifest.name` (the application name)           |
+//!
+//! `Manifest.description` is deliberately **not** injected as an env
+//! var — descriptions can be arbitrarily long and env vars have tight
+//! IC limits. A consumer that wants the description should read it
+//! from the manifest directly via [`Consumer::project_description`].
 //!
 //! ## Dependency ids (`PUBLIC_CANISTER_ID:<dep>`) — frontend-visible
 //!
@@ -558,8 +562,11 @@ impl Consumer {
     /// `update_settings`. It includes:
     ///   - user-declared variables from the manifest (with `null`s resolved
     ///     from [`Self::provide_env_var`]),
-    ///   - `__META_NAME` / `__META_DESCRIPTION` / `__META_PROJECT`
-    ///     (bundle/canister metadata; kept internal to the canister),
+    ///   - `__META_NAME` / `__META_PROJECT` (bundle/canister metadata;
+    ///     kept internal to the canister). The application description
+    ///     is intentionally omitted — it can be arbitrarily long and
+    ///     callers that need it should read it from the manifest
+    ///     directly.
     ///   - `PUBLIC_CANISTER_ID:<dep>` for every declared dependency
     ///     (surfaced to the frontend via `ic_env`).
     ///
@@ -589,11 +596,14 @@ impl Consumer {
         // caller tried to declare: provide_env_var rejects reserved
         // prefixes, and the manifest writer shouldn't set them either
         // — if they did we silently overwrite.
+        //
+        // Note: the application description is intentionally *not*
+        // injected here. Descriptions can be arbitrarily long and IC
+        // canister env vars have tight size limits; putting a large
+        // description here risks `update_settings` failures. Callers
+        // that need the description should read it via
+        // `Consumer::project_description`.
         out.insert("__META_NAME".to_string(), name.to_string());
-        out.insert(
-            "__META_DESCRIPTION".to_string(),
-            self.project_description().to_string(),
-        );
         out.insert(
             "__META_PROJECT".to_string(),
             self.project_name().to_string(),
