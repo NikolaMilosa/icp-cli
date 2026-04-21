@@ -548,33 +548,6 @@ impl Consumer {
             out.insert(public_canister_id_key(dep), id.clone());
         }
 
-        // Synthetic project/description/name. These take precedence over
-        // anything the user tried to declare (they can't: provide_env_var
-        // rejects reserved keys, and the manifest writer shouldn't set
-        // them either — if they did we silently overwrite).
-        out.insert("PUBLIC_CANISTER_NAME".to_string(), name.to_string());
-        out.insert(
-            "PUBLIC_CANISTER_DESCRIPTION".to_string(),
-            self.project_description().to_string(),
-        );
-        out.insert(
-            "PUBLIC_CANISTER_PROJECT".to_string(),
-            self.project_name().to_string(),
-        );
-
-        // PUBLIC_CANISTER_ID:<dep> for every dependency. The key format
-        // matches what the icp-cli asset canister serves via the ic_env
-        // cookie and what frontends read at runtime.
-        for dep in &entry.dependencies {
-            let id = self
-                .canister_ids
-                .get(dep)
-                .ok_or_else(|| ConsumeError::MissingCanisterId {
-                    canister: dep.clone(),
-                })?;
-            out.insert(public_canister_id_key(dep), id.clone());
-        }
-
         Ok(out)
     }
 
