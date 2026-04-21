@@ -31,6 +31,12 @@ pub struct Manifest {
     /// Human readable application name.
     pub name: String,
 
+    /// Optional short version of the application name, for use in
+    /// space-constrained surfaces (tiles, menus, etc). Mirrors the
+    /// `short_name` field from the full schema in `packaging_design.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_name: Option<String>,
+
     /// Optional application version string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub application_version: Option<String>,
@@ -57,6 +63,7 @@ impl Manifest {
         Self {
             manifest_version: MANIFEST_VERSION,
             name: name.into(),
+            short_name: None,
             application_version: None,
             description: None,
             screenshots: Vec::new(),

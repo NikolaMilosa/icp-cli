@@ -303,6 +303,14 @@ impl Consumer {
         &self.bundle.manifest.name
     }
 
+    /// Short application name (`manifest.short_name`), if set. Intended
+    /// for space-constrained UI surfaces (tiles, menus, etc). Not
+    /// injected as a synthetic env var — consumers that want to surface
+    /// it to a canister or frontend should do so explicitly.
+    pub fn project_short_name(&self) -> Option<&str> {
+        self.bundle.manifest.short_name.as_deref()
+    }
+
     /// Bundle description (`manifest.description`). Empty string if absent.
     pub fn project_description(&self) -> &str {
         self.bundle.manifest.description.as_deref().unwrap_or("")

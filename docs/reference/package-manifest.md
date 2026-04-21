@@ -55,6 +55,7 @@ See `packaging_design.md` at the repo root for the full schema. Fields
 currently honored by the builder:
 
 - `name` (required)
+- `short_name` — optional shorter form of `name` for space-constrained surfaces.
 - `application_version`
 - `description`
 - `manifest_version` (defaults to `1`)

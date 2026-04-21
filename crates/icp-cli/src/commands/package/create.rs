@@ -69,6 +69,9 @@ struct BuildManifest {
     name: String,
 
     #[serde(default)]
+    short_name: Option<String>,
+
+    #[serde(default)]
     application_version: Option<String>,
 
     #[serde(default)]
@@ -224,6 +227,7 @@ pub(crate) async fn exec(ctx: &Context, args: &CreateArgs) -> Result<(), anyhow:
     out_manifest.manifest_version = build
         .manifest_version
         .unwrap_or(icp_packaging::MANIFEST_VERSION);
+    out_manifest.short_name = build.short_name.clone();
     out_manifest.application_version = build.application_version.clone();
     out_manifest.description = build.description.clone();
 
