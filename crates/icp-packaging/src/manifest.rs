@@ -45,6 +45,21 @@ pub struct Manifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 
+    /// Icons that represent the application.
+    ///
+    /// Spec-wise these are application-level PWA-style icons. This crate
+    /// additionally treats an icon whose `src` basename (without
+    /// extension) matches a canister name as "that canister's icon" —
+    /// see [`crate::Consumer::icons_for`]. Icons that don't follow the
+    /// convention are still preserved and exposed via
+    /// [`crate::Consumer::icons`]; the mapping is purely additive.
+    ///
+    /// Each [`Icon::src`] is a path *inside the zip* — typically
+    /// `icons/<file>`. The referenced files must be provided to
+    /// [`crate::Bundle::create`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub icons: Vec<Icon>,
+
     /// Screenshots advertised to marketplaces / listings. Each entry's
     /// [`Screenshot::src`] is a path *inside the zip* — typically
     /// `screenshots/<file>`. The referenced files must be provided to
@@ -66,6 +81,7 @@ impl Manifest {
             short_name: None,
             application_version: None,
             description: None,
+            icons: Vec::new(),
             screenshots: Vec::new(),
             canisters: BTreeMap::new(),
         }
@@ -159,6 +175,51 @@ impl Default for ArgFormat {
     fn default() -> Self {
         Self::Candid
     }
+}
+
+/// PWA-style purpose tag for an icon. Matches the spec exactly.
+///
+/// This is independent of this crate's convention of mapping icons to
+/// canisters via filename stem — an icon for a canister can still have
+/// any `purpose`.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum IconPurpose {
+    Any,
+    Maskable,
+    Monochrome,
+}
+
+/// A single application icon entry.
+///
+/// Mirrors the shape of the `icons` items in the full schema
+/// (`packaging_design.md`). Application-level semantics; this crate adds
+/// one extra convention on top: when the basename of `src` (without
+/// extension) equals a canister name, the icon is considered to belong
+/// to that canister and is returned by [`crate::Consumer::icons_for`].
+///
+/// `src` is a path *inside the zip file* (e.g. `icons/frontend.png`).
+/// The file at that path must be provided as part of the icon payload
+/// when calling [`crate::Bundle::create`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Icon {
+    /// Path to the icon file inside the zip.
+    pub src: String,
+
+    /// Space-separated list of icon dimensions (e.g. `"48x48 72x72"`).
+    /// For scalable icons such as SVGs, `"any"` is allowed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sizes: Option<String>,
+
+    /// MIME type (e.g. `"image/png"`). If absent the installer may guess
+    /// from the extension.
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+
+    /// Purpose of the icon (`any`, `maskable`, `monochrome`). When
+    /// absent, defaults to `any` per the spec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<IconPurpose>,
 }
 
 /// Form factor a screenshot was taken on. Matches the spec exactly.

@@ -34,6 +34,9 @@ pub const CANISTERS_DIR: &str = "canisters";
 /// Directory prefix for asset-canister static files. Layout inside the zip
 /// is `assets/<canister_name>/<relative_path>`, matching `packaging_design.md`.
 pub const ASSETS_DIR: &str = "assets";
+/// Directory prefix for icon entries inside the bundle. Icons follow the
+/// same "store verbatim at `src`" convention as screenshots.
+pub const ICONS_DIR: &str = "icons";
 
 /// Errors that can occur while building a bundle.
 #[derive(Debug, Snafu)]
@@ -88,6 +91,17 @@ pub enum CreateError {
 
     #[snafu(display("screenshot src '{src}' must not be empty"))]
     EmptyScreenshotSrc { src: String },
+
+    #[snafu(display("icon '{src}' is referenced in the manifest but no bytes were provided"))]
+    MissingIcon { src: String },
+
+    #[snafu(display(
+        "icon bytes were provided for '{src}' but it is not referenced in the manifest"
+    ))]
+    UnknownIcon { src: String },
+
+    #[snafu(display("icon src '{src}' must not be empty"))]
+    EmptyIconSrc { src: String },
 
     #[snafu(display(
         "assets were provided for canister '{canister}' which is not in the manifest"
@@ -164,6 +178,10 @@ pub struct Bundle {
     pub manifest: Manifest,
     /// Decompressed wasm bytes keyed by canister name.
     pub wasms: BTreeMap<String, Vec<u8>>,
+    /// Icon bytes keyed by the `src` path from the manifest (which is
+    /// also the path inside the zip). Empty if the manifest declares no
+    /// icons.
+    pub icons: BTreeMap<String, Vec<u8>>,
     /// Screenshot bytes keyed by the `src` path from the manifest (which is
     /// also the path inside the zip). Empty if the manifest declares no
     /// screenshots.
@@ -185,6 +203,10 @@ impl Bundle {
     ///   if they are empty we default them to `<name>.wasm.gz`.
     /// - `wasms` maps canister name to the *raw* (uncompressed) wasm bytes.
     ///   Keys must match exactly the canister names in `manifest.canisters`.
+    /// - `icons` maps the `src` path recorded in each
+    ///   [`crate::manifest::Icon`] to the raw image bytes. Keys must
+    ///   match exactly the `src` values in `manifest.icons`. Pass an
+    ///   empty map if the manifest declares no icons.
     /// - `screenshots` maps the `src` path recorded in each
     ///   [`crate::manifest::Screenshot`] to the raw image bytes. Keys must
     ///   match exactly the `src` values in `manifest.screenshots`. Pass an
@@ -199,6 +221,7 @@ impl Bundle {
     pub fn create(
         mut manifest: Manifest,
         wasms: &BTreeMap<String, Vec<u8>>,
+        icons: &BTreeMap<String, Vec<u8>>,
         screenshots: &BTreeMap<String, Vec<u8>>,
         assets: &BTreeMap<String, BTreeMap<String, Vec<u8>>>,
         out: &Path,
@@ -239,6 +262,27 @@ impl Bundle {
         for src in screenshots.keys() {
             if !manifest.screenshots.iter().any(|s| &s.src == src) {
                 return UnknownScreenshotSnafu { src: src.clone() }.fail();
+            }
+        }
+
+        // Same sanity check for icons.
+        for icon in &manifest.icons {
+            if icon.src.is_empty() {
+                return EmptyIconSrcSnafu {
+                    src: icon.src.clone(),
+                }
+                .fail();
+            }
+            if !icons.contains_key(&icon.src) {
+                return MissingIconSnafu {
+                    src: icon.src.clone(),
+                }
+                .fail();
+            }
+        }
+        for src in icons.keys() {
+            if !manifest.icons.iter().any(|i| &i.src == src) {
+                return UnknownIconSnafu { src: src.clone() }.fail();
             }
         }
 
@@ -327,6 +371,18 @@ impl Bundle {
                 })?;
             zip.write_all(bytes).context(WriteBytesSnafu {
                 entry: shot.src.clone(),
+            })?;
+        }
+
+        // icons. Same convention as screenshots: `src` is the in-zip path.
+        for icon in &manifest.icons {
+            let bytes = icons.get(&icon.src).expect("presence checked above");
+            zip.start_file(&icon.src, options)
+                .context(WriteEntrySnafu {
+                    entry: icon.src.clone(),
+                })?;
+            zip.write_all(bytes).context(WriteBytesSnafu {
+                entry: icon.src.clone(),
             })?;
         }
 
@@ -425,6 +481,19 @@ impl Bundle {
             screenshots.insert(shot.src.clone(), buf);
         }
 
+        // Read icon blobs. Same storage convention as screenshots.
+        let mut icons: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        for icon in &manifest.icons {
+            let mut zentry = archive.by_name(&icon.src).context(ReadEntrySnafu {
+                entry: icon.src.clone(),
+            })?;
+            let mut buf = Vec::new();
+            zentry.read_to_end(&mut buf).context(ReadBytesSnafu {
+                entry: icon.src.clone(),
+            })?;
+            icons.insert(icon.src.clone(), buf);
+        }
+
         // Read asset files. We enumerate zip entries directly rather than
         // driving this from the manifest — the manifest does not list
         // individual asset files. Entries under `assets/<canister>/...`
@@ -475,6 +544,7 @@ impl Bundle {
         Ok(Bundle {
             manifest,
             wasms,
+            icons,
             screenshots,
             assets,
         })

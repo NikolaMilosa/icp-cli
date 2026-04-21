@@ -48,6 +48,7 @@ the bundle is written:
 | `canisters.<name>.wasm` | per-canister, optional | Path to a wasm file on disk. When omitted, the wasm is looked up in the local artifact store (populated by `icp build`, selected with `-e <environment>`). |
 | `canisters.<name>.asset_dir` | per-canister, optional | Path to a directory whose contents are recursively packed under `assets/<name>/` in the zip. Presence of this field implies `type: assets`. |
 | `screenshots[].src` | per-screenshot | Path to an image file on disk. The builder reads the bytes and rewrites `src` to `screenshots/<basename>` inside the zip. |
+| `icons[].src` | per-icon | Path to an image file on disk. The builder reads the bytes and rewrites `src` to `icons/<basename>` inside the zip. Basename (without extension) matching a canister name associates the icon with that canister. |
 
 ## Runtime-manifest fields (passed through verbatim)
 
@@ -64,6 +65,7 @@ currently honored by the builder:
 - `canisters.<name>.env_variables` — map of `key -> string | null`. A `null` value means "installer must prompt the user at install time".
 - `canisters.<name>.init_arg` — `{ "arg": "(...)", "format": "candid" | "json" }`.
 - `canisters.<name>.upgrade_arg` — same shape as `init_arg`.
+- `icons[]` — `{ src, sizes?, type?, purpose? }`. `src` is a path on disk; the builder reads the file and rewrites `src` to `icons/<basename>` inside the zip. An icon whose filename stem (without extension) matches a canister name is treated as "that canister's icon" by the consumer (see `Consumer::icons_for`). Icons whose stem doesn't match any canister are still included as generic application icons.
 - `screenshots[]` — `{ src, sizes?, type?, form_factor?, label? }` (`src` interpreted per above).
 
 ## Full example
@@ -89,6 +91,12 @@ currently honored by the builder:
     }
   },
 
+  "icons": [
+    { "src": "./icons/backend.png",  "sizes": "512x512", "purpose": "any" },
+    { "src": "./icons/frontend.png", "sizes": "512x512", "purpose": "any" },
+    { "src": "./icons/app.svg",      "sizes": "any",     "purpose": "maskable" }
+  ],
+
   "screenshots": [
     {
       "src": "./frontend/public/logo.png",
@@ -98,6 +106,10 @@ currently honored by the builder:
   ]
 }
 ```
+
+The first two icons are associated with the `backend` and `frontend`
+canisters by filename stem; the third (`app.svg`) is an application-level
+icon (no stem match).
 
 ## Behavior notes
 

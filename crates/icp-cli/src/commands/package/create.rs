@@ -5,11 +5,11 @@ use clap::Args;
 use icp::context::{Context, EnvironmentSelection};
 use icp::prelude::{Path, PathBuf};
 use icp_packaging::{
-    ArgFormat, Bundle, CanisterArg, CanisterEntry, CanisterKind, Manifest, Screenshot,
-    ScreenshotFormFactor, bundle::default_wasm_path,
+    ArgFormat, Bundle, CanisterArg, CanisterEntry, CanisterKind, Icon, IconPurpose, Manifest,
+    Screenshot, ScreenshotFormFactor, bundle::default_wasm_path,
 };
 use serde::Deserialize;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::options::EnvironmentOpt;
 
@@ -76,6 +76,9 @@ struct BuildManifest {
 
     #[serde(default)]
     description: Option<String>,
+
+    #[serde(default)]
+    icons: Vec<BuildIcon>,
 
     #[serde(default)]
     screenshots: Vec<BuildScreenshot>,
@@ -150,6 +153,44 @@ impl From<ArgFormatSpec> for ArgFormat {
         match v {
             ArgFormatSpec::Candid => ArgFormat::Candid,
             ArgFormatSpec::Json => ArgFormat::Json,
+        }
+    }
+}
+
+/// Icon entry in the build manifest. `src` is a path on disk; the
+/// builder reads the bytes and rewrites `src` to its in-zip location.
+///
+/// To associate an icon with a canister, name the file so its stem
+/// (filename without extension) matches the canister name —
+/// e.g. `./icons/frontend.png` for a canister `frontend`. Icons whose
+/// stem doesn't match any canister are still included in the bundle as
+/// application-level icons.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BuildIcon {
+    src: String,
+    #[serde(default)]
+    sizes: Option<String>,
+    #[serde(default, rename = "type")]
+    mime_type: Option<String>,
+    #[serde(default)]
+    purpose: Option<IconPurposeSpec>,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+enum IconPurposeSpec {
+    Any,
+    Maskable,
+    Monochrome,
+}
+
+impl From<IconPurposeSpec> for IconPurpose {
+    fn from(v: IconPurposeSpec) -> Self {
+        match v {
+            IconPurposeSpec::Any => IconPurpose::Any,
+            IconPurposeSpec::Maskable => IconPurpose::Maskable,
+            IconPurposeSpec::Monochrome => IconPurpose::Monochrome,
         }
     }
 }
@@ -298,7 +339,59 @@ pub(crate) async fn exec(ctx: &Context, args: &CreateArgs) -> Result<(), anyhow:
         wasms.insert(name.clone(), wasm);
     }
 
-    // 4. Read and attach screenshots. Source path -> bytes; the in-zip
+    // 4. Read and attach icons. Same disk-path -> in-zip-path rewrite
+    //    as screenshots, but rooted at `icons/`. The filename stem must
+    //    match a canister name for the icon to be considered "that
+    //    canister's icon" by the consumer; we preserve the basename so
+    //    that association works (we do not rename files here).
+    let mut icon_bytes: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    let mut used_icon_names: std::collections::BTreeSet<String> = Default::default();
+    for spec in &build.icons {
+        let abs = resolve_relative(&manifest_dir, &spec.src);
+        let bytes = std::fs::read(abs.as_std_path())
+            .with_context(|| format!("failed to read icon '{abs}'"))?;
+
+        let file_name = abs
+            .file_name()
+            .ok_or_else(|| anyhow!("icon path '{abs}' has no file name"))?;
+        let mut candidate = format!("icons/{file_name}");
+        let mut n: u32 = 1;
+        while used_icon_names.contains(&candidate) {
+            n += 1;
+            candidate = format!("icons/{n}-{file_name}");
+        }
+        used_icon_names.insert(candidate.clone());
+
+        let mime_type = spec.mime_type.clone().or_else(|| guess_mime_type(&abs));
+
+        out_manifest.icons.push(Icon {
+            src: candidate.clone(),
+            sizes: spec.sizes.clone(),
+            mime_type,
+            purpose: spec.purpose.map(IconPurpose::from),
+        });
+        icon_bytes.insert(candidate, bytes);
+    }
+
+    // Warn about canisters that don't have a matching icon. The rule:
+    // an icon "belongs to" a canister when its filename stem (without
+    // extension) equals the canister name. Matches the consumer's
+    // `icons_for` convention. Non-fatal — icons are optional metadata.
+    for name in &canister_names {
+        let has_icon = out_manifest
+            .icons
+            .iter()
+            .any(|icon| icon_stem_matches(&icon.src, name));
+        if !has_icon {
+            warn!(
+                "canister '{name}' has no matching icon in the manifest; \
+                 add an icon whose filename stem is '{name}' (e.g. '{name}.png') \
+                 to associate one"
+            );
+        }
+    }
+
+    // 5. Read and attach screenshots. Source path -> bytes; the in-zip
     //    path is always `screenshots/<basename>` with an auto-disambiguator
     //    on collisions.
     let mut screenshot_bytes: BTreeMap<String, Vec<u8>> = BTreeMap::new();
@@ -331,11 +424,12 @@ pub(crate) async fn exec(ctx: &Context, args: &CreateArgs) -> Result<(), anyhow:
         screenshot_bytes.insert(candidate, bytes);
     }
 
-    // 5. Write the zip.
+    // 6. Write the zip.
     let total_assets: usize = assets.values().map(BTreeMap::len).sum();
     Bundle::create(
         out_manifest,
         &wasms,
+        &icon_bytes,
         &screenshot_bytes,
         &assets,
         args.out.as_std_path(),
@@ -343,9 +437,10 @@ pub(crate) async fn exec(ctx: &Context, args: &CreateArgs) -> Result<(), anyhow:
     .context("failed to create bundle")?;
 
     info!(
-        "Bundle written to {} ({} canister(s), {} screenshot(s), {} asset file(s))",
+        "Bundle written to {} ({} canister(s), {} icon(s), {} screenshot(s), {} asset file(s))",
         args.out,
         canister_names.len(),
+        build.icons.len(),
         build.screenshots.len(),
         total_assets,
     );
@@ -409,6 +504,20 @@ fn collect_asset_dir(dir: &Path) -> Result<BTreeMap<String, Vec<u8>>, anyhow::Er
         }
     }
     Ok(out)
+}
+
+/// Mirrors `icp_packaging::consumer`'s icon-matching rule: an icon at
+/// path `src` is associated with canister `name` iff the basename of
+/// `src` stripped of its extension equals `name`. Kept duplicated (not
+/// imported) because the matching rule is a consumer-side convention;
+/// the CLI only needs it for the "missing icon" warning.
+fn icon_stem_matches(src: &str, canister: &str) -> bool {
+    let file_name = src.rsplit('/').next().unwrap_or(src);
+    let stem = file_name
+        .split_once('.')
+        .map(|(s, _)| s)
+        .unwrap_or(file_name);
+    stem == canister
 }
 
 /// Very small MIME-type guesser for screenshots. Only covers formats

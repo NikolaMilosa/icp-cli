@@ -79,7 +79,7 @@ use std::collections::BTreeMap;
 use snafu::{ResultExt, Snafu};
 
 use crate::bundle::{Bundle, OpenError};
-use crate::manifest::{ArgFormat, CanisterArg, CanisterEntry, Manifest};
+use crate::manifest::{ArgFormat, CanisterArg, CanisterEntry, Icon, Manifest};
 
 /// Errors produced by the [`Consumer`] API.
 #[derive(Debug, Snafu)]
@@ -357,6 +357,62 @@ impl Consumer {
     /// populate a listing page before or after install.
     pub fn screenshots(&self) -> &BTreeMap<String, Vec<u8>> {
         &self.bundle.screenshots
+    }
+
+    // --- Icons ---------------------------------------------------------
+
+    /// All icons declared in the manifest, in declaration order.
+    ///
+    /// These are application-level icons; any icon whose `src` basename
+    /// (without extension) matches a canister name is additionally
+    /// exposed via [`Self::icons_for`]. Icons that don't match any
+    /// canister are still included in this list.
+    pub fn icons(&self) -> &[Icon] {
+        &self.bundle.manifest.icons
+    }
+
+    /// Raw bytes for a single icon, keyed by the `src` path that
+    /// appears in the manifest.
+    pub fn icon_bytes(&self, src: &str) -> Option<&[u8]> {
+        self.bundle.icons.get(src).map(Vec::as_slice)
+    }
+
+    /// Icons associated with the given canister by the filename-stem
+    /// convention: every [`Icon`] whose `src` basename (without
+    /// extension) equals `canister` is returned. Returns an empty vec
+    /// if the canister has no matching icons.
+    ///
+    /// Fails if the canister is not part of the bundle.
+    ///
+    /// A canister may legitimately have multiple icons (e.g. one per
+    /// size/purpose); this method returns them all in manifest order.
+    pub fn icons_for(&self, canister: &str) -> Result<Vec<&Icon>, ConsumeError> {
+        self.canister(canister)?;
+        Ok(self
+            .bundle
+            .manifest
+            .icons
+            .iter()
+            .filter(|i| icon_src_matches_canister(&i.src, canister))
+            .collect())
+    }
+
+    /// All icons in the bundle grouped by canister name, using the
+    /// filename-stem convention. Icons that don't match any canister
+    /// are omitted.
+    ///
+    /// The map is keyed by canister name and preserves manifest order
+    /// inside each vec.
+    pub fn icons_by_canister(&self) -> BTreeMap<String, Vec<&Icon>> {
+        let mut out: BTreeMap<String, Vec<&Icon>> = BTreeMap::new();
+        for icon in &self.bundle.manifest.icons {
+            for name in self.bundle.manifest.canisters.keys() {
+                if icon_src_matches_canister(&icon.src, name) {
+                    out.entry(name.clone()).or_default().push(icon);
+                }
+            }
+        }
+        out
     }
 
     // --- Assets --------------------------------------------------------
@@ -645,6 +701,25 @@ impl Consumer {
 /// `URLSearchParams.get("PUBLIC_CANISTER_ID:<name>")`.
 fn public_canister_id_key(canister_name: &str) -> String {
     format!("{PUBLIC_CANISTER_ID_PREFIX}{canister_name}")
+}
+
+/// Returns true when the basename of `src` (without extension) equals
+/// `canister`. Used to associate an icon entry with a canister by
+/// filename convention (e.g. `icons/frontend.png` ↔ canister
+/// `frontend`). The comparison is case-sensitive and matches exactly —
+/// no normalization, no prefix/suffix tolerance.
+fn icon_src_matches_canister(src: &str, canister: &str) -> bool {
+    // Strip directory: keep the substring after the last '/' (if any).
+    let file_name = src.rsplit('/').next().unwrap_or(src);
+    // Strip extension: keep everything before the first '.'.
+    //
+    // We use `split_once` so names like `logo.dark.png` yield the stem
+    // `logo`, matching how browsers treat the primary extension.
+    let stem = file_name
+        .split_once('.')
+        .map(|(s, _)| s)
+        .unwrap_or(file_name);
+    stem == canister
 }
 
 /// Topological sort of the `canisters` map on the `dependencies` edges.

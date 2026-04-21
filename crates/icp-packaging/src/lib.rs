@@ -42,6 +42,6 @@ pub mod manifest;
 pub use bundle::{Bundle, CreateError, OpenError};
 pub use consumer::{ConsumeError, Consumer, InstallArg, InstallMode, InstallStep};
 pub use manifest::{
-    ArgFormat, CanisterArg, CanisterEntry, CanisterKind, Manifest, Screenshot,
+    ArgFormat, CanisterArg, CanisterEntry, CanisterKind, Icon, IconPurpose, Manifest, Screenshot,
     ScreenshotFormFactor, MANIFEST_VERSION,
 };
