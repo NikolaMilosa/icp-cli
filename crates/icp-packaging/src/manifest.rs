@@ -45,6 +45,13 @@ pub struct Manifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 
+    /// Optional canister name designated as the application's main
+    /// entry point. Per the spec this must reference one of the
+    /// canisters in [`Manifest::canisters`]; the bundle builder and
+    /// reader both validate this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main_canister: Option<String>,
+
     /// Icons that represent the application.
     ///
     /// Spec-wise these are application-level PWA-style icons. This crate
@@ -81,6 +88,7 @@ impl Manifest {
             short_name: None,
             application_version: None,
             description: None,
+            main_canister: None,
             icons: Vec::new(),
             screenshots: Vec::new(),
             canisters: BTreeMap::new(),

@@ -77,6 +77,11 @@ struct BuildManifest {
     #[serde(default)]
     description: Option<String>,
 
+    /// Optional name of the canister to flag as the application's main
+    /// entry point. Must match one of the keys under `canisters`.
+    #[serde(default)]
+    main_canister: Option<String>,
+
     #[serde(default)]
     icons: Vec<BuildIcon>,
 
@@ -252,6 +257,19 @@ pub(crate) async fn exec(ctx: &Context, args: &CreateArgs) -> Result<(), anyhow:
         ));
     }
 
+    // main_canister, if provided, must be one of the canisters. We
+    // check this up front (rather than relying on `Bundle::create`'s
+    // validation) so the user gets a manifest-level error message
+    // rather than a deeper bundle-layer one.
+    if let Some(main) = build.main_canister.as_deref() {
+        if !build.canisters.contains_key(main) {
+            return Err(anyhow!(
+                "main_canister '{main}' is not declared under `canisters` in '{}'",
+                args.manifest
+            ));
+        }
+    }
+
     // 2. Load the environment lazily. We only need it when at least one
     //    canister omits its `wasm` field. Wrap in an Option so we don't
     //    fail if no project is set up and every canister specifies a wasm.
@@ -271,6 +289,9 @@ pub(crate) async fn exec(ctx: &Context, args: &CreateArgs) -> Result<(), anyhow:
     out_manifest.short_name = build.short_name.clone();
     out_manifest.application_version = build.application_version.clone();
     out_manifest.description = build.description.clone();
+    // main_canister is cross-validated against the canister list below,
+    // after we've parsed the canister map.
+    out_manifest.main_canister = build.main_canister.clone();
 
     let mut wasms: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     let mut assets: BTreeMap<String, BTreeMap<String, Vec<u8>>> = BTreeMap::new();

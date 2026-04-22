@@ -59,6 +59,7 @@ currently honored by the builder:
 - `short_name` — optional shorter form of `name` for space-constrained surfaces.
 - `application_version`
 - `description`
+- `main_canister` — optional name of the canister to designate as the application's main entry point. Must match one of the keys under `canisters` (validated at build time and again when a consumer opens the bundle).
 - `manifest_version` (defaults to `1`)
 - `canisters.<name>.type` — `backend` (default) or `assets`; overridden to `assets` when `asset_dir` is set.
 - `canisters.<name>.dependencies` — list of other canister names in this bundle.
@@ -76,6 +77,7 @@ currently honored by the builder:
   "name": "ICDocs",
   "application_version": "0.1.0",
   "description": "Decentralized document management on the Internet Computer",
+  "main_canister": "frontend",
 
   "canisters": {
     "backend": {

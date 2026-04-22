@@ -120,6 +120,9 @@ pub enum CreateError {
         "asset path '{path}' for canister '{canister}' must be relative (no leading '/')"
     ))]
     AbsoluteAssetPath { canister: String, path: String },
+
+    #[snafu(display("main_canister '{canister}' is not in the manifest's canister list"))]
+    UnknownMainCanister { canister: String },
 }
 
 /// Errors that can occur while reading a bundle.
@@ -165,6 +168,9 @@ pub enum OpenError {
 
     #[snafu(display("manifest has a dependency cycle involving '{canister}'"))]
     DependencyCycle { canister: String },
+
+    #[snafu(display("main_canister '{canister}' is not in the manifest's canister list"))]
+    UnknownMainCanisterOnOpen { canister: String },
 }
 
 /// In-memory representation of an opened bundle.
@@ -239,6 +245,16 @@ impl Bundle {
             if !manifest.canisters.contains_key(name) {
                 return UnknownCanisterSnafu {
                     canister: name.clone(),
+                }
+                .fail();
+            }
+        }
+
+        // main_canister, if set, must refer to a canister in the manifest.
+        if let Some(main) = manifest.main_canister.as_deref() {
+            if !manifest.canisters.contains_key(main) {
+                return UnknownMainCanisterSnafu {
+                    canister: main.to_string(),
                 }
                 .fail();
             }
@@ -449,6 +465,7 @@ impl Bundle {
         };
 
         validate_dependencies(&manifest)?;
+        validate_main_canister(&manifest)?;
 
         // Read and decompress each canister wasm.
         let mut wasms: BTreeMap<String, Vec<u8>> = BTreeMap::new();
@@ -575,6 +592,20 @@ fn gunzip_bytes(data: &[u8]) -> std::io::Result<Vec<u8>> {
 ///
 /// This is intentionally small; a real installer will re-run a proper
 /// topological sort when deciding install order.
+/// Enforce the "main_canister refers to a real canister" invariant on
+/// read. Matches the build-time check in [`Bundle::create`].
+fn validate_main_canister(manifest: &Manifest) -> Result<(), OpenError> {
+    if let Some(main) = manifest.main_canister.as_deref() {
+        if !manifest.canisters.contains_key(main) {
+            return UnknownMainCanisterOnOpenSnafu {
+                canister: main.to_string(),
+            }
+            .fail();
+        }
+    }
+    Ok(())
+}
+
 fn validate_dependencies(manifest: &Manifest) -> Result<(), OpenError> {
     // First: all deps reference known canisters.
     for (name, entry) in &manifest.canisters {

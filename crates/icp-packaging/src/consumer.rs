@@ -48,10 +48,11 @@
 //! frontend (the `ic_env` cookie only surfaces `PUBLIC_*` keys). The
 //! canister itself can read these with `ic_env::get_env_var` etc.
 //!
-//! | Name                | Value                                            |
-//! |---------------------|--------------------------------------------------|
-//! | `__META_NAME`       | name of *this* canister (manifest key)           |
-//! | `__META_PROJECT`    | `Manifest.name` (the application name)           |
+//! | Name                  | Value                                                                    |
+//! |-----------------------|--------------------------------------------------------------------------|
+//! | `__META_NAME`         | name of *this* canister (manifest key)                                   |
+//! | `__META_PROJECT`      | `Manifest.name` (the application name)                                   |
+//! | `__META_MAIN_CANISTER`| `"true"` if this canister is `Manifest.main_canister`, otherwise `"false"` |
 //!
 //! `Manifest.description` is deliberately **not** injected as an env
 //! var — descriptions can be arbitrarily long and env vars have tight
@@ -320,6 +321,17 @@ impl Consumer {
         self.bundle.manifest.description.as_deref().unwrap_or("")
     }
 
+    /// Name of the canister the manifest designates as the application's
+    /// main entry point (`manifest.main_canister`), if any.
+    ///
+    /// The bundle builder and reader both validate that this references
+    /// a real canister in the manifest, so the returned value, when
+    /// present, is always a valid key for [`Self::canister`] / related
+    /// getters.
+    pub fn main_canister(&self) -> Option<&str> {
+        self.bundle.manifest.main_canister.as_deref()
+    }
+
     /// The full underlying manifest, if the caller wants the raw view.
     pub fn manifest(&self) -> &Manifest {
         &self.bundle.manifest
@@ -562,11 +574,13 @@ impl Consumer {
     /// `update_settings`. It includes:
     ///   - user-declared variables from the manifest (with `null`s resolved
     ///     from [`Self::provide_env_var`]),
-    ///   - `__META_NAME` / `__META_PROJECT` (bundle/canister metadata;
-    ///     kept internal to the canister). The application description
-    ///     is intentionally omitted — it can be arbitrarily long and
-    ///     callers that need it should read it from the manifest
-    ///     directly.
+    ///   - `__META_NAME` / `__META_PROJECT` / `__META_MAIN_CANISTER`
+    ///     (bundle/canister metadata; kept internal to the canister).
+    ///     `__META_MAIN_CANISTER` is `"true"` when this canister equals
+    ///     `Manifest.main_canister`, otherwise `"false"`. The
+    ///     application description is intentionally omitted — it can
+    ///     be arbitrarily long and callers that need it should read it
+    ///     from the manifest directly.
     ///   - `PUBLIC_CANISTER_ID:<dep>` for every declared dependency
     ///     (surfaced to the frontend via `ic_env`).
     ///
@@ -607,6 +621,14 @@ impl Consumer {
         out.insert(
             "__META_PROJECT".to_string(),
             self.project_name().to_string(),
+        );
+        // "true" / "false" string literals (not `1`/`0` or Candid
+        // booleans) so canister-side readers can keep the simple
+        // "env var == string" model without dragging in a bool parser.
+        let is_main = self.main_canister() == Some(name);
+        out.insert(
+            "__META_MAIN_CANISTER".to_string(),
+            (if is_main { "true" } else { "false" }).to_string(),
         );
 
         // PUBLIC_CANISTER_ID:<dep> for every dependency. This format
