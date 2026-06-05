@@ -49,9 +49,11 @@ This document contains the help content for the `icp` command-line program.
 * [`icp identity import`↴](#icp-identity-import)
 * [`icp identity link`↴](#icp-identity-link)
 * [`icp identity link hsm`↴](#icp-identity-link-hsm)
+* [`icp identity link web`↴](#icp-identity-link-web)
 * [`icp identity list`↴](#icp-identity-list)
 * [`icp identity new`↴](#icp-identity-new)
 * [`icp identity principal`↴](#icp-identity-principal)
+* [`icp identity reauth`↴](#icp-identity-reauth)
 * [`icp identity rename`↴](#icp-identity-rename)
 * [`icp network`↴](#icp-network)
 * [`icp network list`↴](#icp-network-list)
@@ -86,7 +88,7 @@ This document contains the help content for the `icp` command-line program.
 * `identity` — Manage your identities
 * `network` — Launch and manage local test networks
 * `new` — Create a new ICP project from a template
-* `project` — Display information about the current project
+* `project` — Manage the current project
 * `settings` — Configure user settings
 * `sync` — Synchronize canisters
 * `token` — Perform token transactions
@@ -928,6 +930,7 @@ Manage your identities
 * `list` — List the identities
 * `new` — Create a new identity
 * `principal` — Display the principal for the current identity
+* `reauth` — Re-authenticate a delegation-based identity
 * `rename` — Rename an identity
 
 
@@ -1114,6 +1117,7 @@ Link an external key to a new identity
 ###### **Subcommands:**
 
 * `hsm` — Link an HSM key to a new identity
+* `web` — Link a web-based identity (such as Internet Identity) to a new icp-cli identity
 
 
 
@@ -1135,6 +1139,32 @@ Link an HSM key to a new identity
   Default value: `0`
 * `--key-id <KEY_ID>` — Key ID on the HSM (e.g., "01" for PIV authentication key)
 * `--pin-file <PIN_FILE>` — Read HSM PIN from a file instead of prompting
+
+
+
+## `icp identity link web`
+
+Link a web-based identity (such as Internet Identity) to a new icp-cli identity
+
+**Usage:** `icp identity link web [OPTIONS] <NAME>`
+
+###### **Arguments:**
+
+* `<NAME>` — Name for the linked identity
+
+###### **Options:**
+
+* `--auth <AUTH>` — Auth domain to sign in at (e.g. id.ai or identity.ce1.com). Its `/.well-known/cli-auth-config` decides the login path
+
+  Default value: `https://id.ai`
+* `--app <APP>` — Delegation domain to get an identity for (e.g. oisy.com). When omitted, the auth domain picks its default (id.ai uses cli.id.ai)
+* `--storage <STORAGE>` — Where to store the session private key
+
+  Default value: `keyring`
+
+  Possible values: `plaintext`, `keyring`, `password`
+
+* `--storage-password-file <FILE>` — Read the storage password from a file instead of prompting (for --storage password)
 
 
 
@@ -1185,6 +1215,18 @@ Display the principal for the current identity
 ###### **Options:**
 
 * `--identity <IDENTITY>` — The user identity to run this command as
+
+
+
+## `icp identity reauth`
+
+Re-authenticate a delegation-based identity
+
+**Usage:** `icp identity reauth <NAME>`
+
+###### **Arguments:**
+
+* `<NAME>` — Name of the identity to re-authenticate
 
 
 
@@ -1446,7 +1488,7 @@ Under the hood templates are generated with `cargo-generate`. See the cargo-gene
 
 ## `icp project`
 
-Display information about the current project
+Manage the current project
 
 **Usage:** `icp project <COMMAND>`
 
