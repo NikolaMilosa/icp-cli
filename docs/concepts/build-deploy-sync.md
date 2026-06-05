@@ -112,17 +112,43 @@ The sync phase handles post-deployment operations that depend on the canister be
 ### Common Use Cases
 
 - **Asset canisters** — Upload static files after the canister is running
+- **Seeding or configuring state** — Make post-deployment canister calls
 
-### Asset Sync
+### Plugin Sync Steps
 
-For frontend canisters, sync uploads your built assets:
+A `plugin` sync step runs a sandboxed WebAssembly [sync plugin](sync-plugins.md)
+against the canister being synced. This is how post-deployment operations like
+asset uploads work — for frontend canisters you typically upload your built
+assets with a plugin provided by a recipe (such as `@dfinity/asset-canister`)
+rather than a built-in step.
+
+A plugin can call update and query methods on the canister and read directories
+and files you declare, all inside a WASI sandbox with no network or write access.
+See [Sync Plugins](sync-plugins.md) for the full mechanism and [Writing a Sync
+Plugin](../guides/writing-sync-plugins.md) to author your own.
+
+### Script Sync Steps
+
+You can also run arbitrary shell commands in sync steps:
 
 ```yaml
 sync:
   steps:
-    - type: assets
-      dir: dist
+    - type: script
+      commands:
+        - my-tool upload --canister "$ICP_CLI_CID" --env "$ICP_CLI_ENVIRONMENT"
 ```
+
+### Environment Variables
+
+Script sync steps have access to:
+
+- `ICP_CLI_ENVIRONMENT` — The current environment name (e.g. `local`, `staging`)
+- `ICP_CLI_NETWORK` — The current network name (e.g. `local`, `ic`)
+- `ICP_CLI_CID` — The canister ID of the canister being synced
+- `ICP_CLI_CID_<NAME>` — The canister ID of every canister with a registered ID in the current environment (name uppercased, non-alphanumeric characters replaced with `_`)
+
+See [Environment Variables Reference](../reference/environment-variables.md#sync-script-variables) for full details.
 
 ### When Sync Runs
 

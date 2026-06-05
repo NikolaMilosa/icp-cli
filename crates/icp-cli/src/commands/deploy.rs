@@ -11,6 +11,7 @@ use icp::{
 };
 use icp_canister_interfaces::candid_ui::MAINNET_CANDID_UI_CID;
 use serde::Serialize;
+use std::collections::BTreeMap;
 use tracing::info;
 
 use crate::{
@@ -21,7 +22,7 @@ use crate::{
         candid_compat::check_candid_compatibility_many,
         create::{CreateOperation, CreateTarget},
         install::{install_many, resolve_install_mode_and_status},
-        settings::sync_settings_many,
+        settings::{sync_controller_dependents, sync_settings_many},
         sync::sync_many,
     },
     options::{EnvironmentOpt, IdentityOpt},
@@ -198,6 +199,17 @@ pub(crate) async fn exec(ctx: &Context, args: &DeployArgs) -> Result<(), anyhow:
                     ctx.set_canister_id_for_env(canister_name, id, &environment_selection)
                         .await
                         .map_err(|e| anyhow!(e))?;
+                    // Apply controller settings for any already-created canister that was
+                    // waiting for this one to exist (e.g. created via `icp canister create`).
+                    sync_controller_dependents(
+                        ctx,
+                        &agent,
+                        args.proxy,
+                        canister_name,
+                        &environment_selection,
+                    )
+                    .await
+                    .map_err(|e| anyhow!(e))?;
                 }
                 Err(err) => {
                     error = Some(err.into());
@@ -247,15 +259,21 @@ pub(crate) async fn exec(ctx: &Context, args: &DeployArgs) -> Result<(), anyhow:
         args.proxy,
         &env.name,
         target_canisters.clone(),
-        canister_list,
+        canister_list.clone(),
         ctx.debug,
     )
     .await
     .map_err(|e| anyhow!(e))?;
 
-    sync_settings_many(agent.clone(), args.proxy, target_canisters, ctx.debug)
-        .await
-        .map_err(|e| anyhow!(e))?;
+    sync_settings_many(
+        agent.clone(),
+        args.proxy,
+        target_canisters,
+        canister_list,
+        ctx.debug,
+    )
+    .await
+    .map_err(|e| anyhow!(e))?;
 
     // Install the selected canisters
 
@@ -362,7 +380,25 @@ pub(crate) async fn exec(ctx: &Context, args: &DeployArgs) -> Result<(), anyhow:
         // method to permit the user identity to upload assets directly before syncing.
         info!("Syncing canisters:");
 
-        sync_many(ctx.syncer.clone(), agent.clone(), sync_canisters, ctx.debug).await?;
+        let canister_ids: BTreeMap<String, Principal> = ctx
+            .ids_by_environment(&environment_selection)
+            .await?
+            .into_iter()
+            .collect();
+
+        let pkg_cache = ctx.dirs.package_cache()?;
+        sync_many(
+            ctx.syncer.clone(),
+            agent.clone(),
+            sync_canisters,
+            environment_selection.name().to_owned(),
+            env.network.name.clone(),
+            canister_ids,
+            args.proxy,
+            ctx.debug,
+            &pkg_cache,
+        )
+        .await?;
     }
 
     // Print URLs for deployed canisters

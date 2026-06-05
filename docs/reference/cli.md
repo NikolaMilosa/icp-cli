@@ -43,14 +43,20 @@ This document contains the help content for the `icp` command-line program.
 * [`icp identity`↴](#icp-identity)
 * [`icp identity account-id`↴](#icp-identity-account-id)
 * [`icp identity default`↴](#icp-identity-default)
+* [`icp identity delegation`↴](#icp-identity-delegation)
+* [`icp identity delegation request`↴](#icp-identity-delegation-request)
+* [`icp identity delegation sign`↴](#icp-identity-delegation-sign)
+* [`icp identity delegation use`↴](#icp-identity-delegation-use)
 * [`icp identity delete`↴](#icp-identity-delete)
 * [`icp identity export`↴](#icp-identity-export)
 * [`icp identity import`↴](#icp-identity-import)
 * [`icp identity link`↴](#icp-identity-link)
 * [`icp identity link hsm`↴](#icp-identity-link-hsm)
+* [`icp identity link web`↴](#icp-identity-link-web)
 * [`icp identity list`↴](#icp-identity-list)
 * [`icp identity new`↴](#icp-identity-new)
 * [`icp identity principal`↴](#icp-identity-principal)
+* [`icp identity reauth`↴](#icp-identity-reauth)
 * [`icp identity rename`↴](#icp-identity-rename)
 * [`icp network`↴](#icp-network)
 * [`icp network list`↴](#icp-network-list)
@@ -85,7 +91,7 @@ This document contains the help content for the `icp` command-line program.
 * `identity` — Manage your identities
 * `network` — Launch and manage local test networks
 * `new` — Create a new ICP project from a template
-* `project` — Display information about the current project
+* `project` — Manage the current project
 * `settings` — Configure user settings
 * `sync` — Synchronize canisters
 * `token` — Perform token transactions
@@ -777,6 +783,7 @@ Display the cycles balance
 * `-e`, `--environment <ENVIRONMENT>` — Override the environment to connect to. By default, the local environment is used
 * `--identity <IDENTITY>` — The user identity to run this command as
 * `--subaccount <SUBACCOUNT>` — The subaccount to check the balance for
+* `--of-principal <OF_PRINCIPAL>` — Check the balance of this principal instead of the current identity
 * `--json` — Output command results as JSON
 * `-q`, `--quiet` — Suppress human-readable output; print only the balance
 
@@ -918,6 +925,7 @@ Manage your identities
 
 * `account-id` — Display the ICP ledger or ICRC-1 account identifier for the current identity
 * `default` — Display or set the currently selected identity
+* `delegation` — Manage delegations for identities
 * `delete` — Delete an identity
 * `export` — Print the PEM file for the identity
 * `import` — Import a new identity
@@ -925,6 +933,7 @@ Manage your identities
 * `list` — List the identities
 * `new` — Create a new identity
 * `principal` — Display the principal for the current identity
+* `reauth` — Re-authenticate a delegation-based identity
 * `rename` — Rename an identity
 
 
@@ -962,6 +971,77 @@ Display or set the currently selected identity
 ###### **Arguments:**
 
 * `<NAME>` — Identity to set as default. If omitted, prints the current default
+
+
+
+## `icp identity delegation`
+
+Manage delegations for identities
+
+**Usage:** `icp identity delegation <COMMAND>`
+
+###### **Subcommands:**
+
+* `request` — Create a pending delegation identity with a new P256 session key
+* `sign` — Sign a delegation from the selected identity to a target key
+* `use` — Complete a pending delegation identity by providing a signed delegation chain
+
+
+
+## `icp identity delegation request`
+
+Create a pending delegation identity with a new P256 session key
+
+Prints the session public key as a PEM-encoded SPKI to stdout. Pass this to `icp identity delegation sign --key-pem` on another machine to obtain a delegation chain, then complete the identity with `icp identity delegation use`.
+
+**Usage:** `icp identity delegation request [OPTIONS] <NAME>`
+
+###### **Arguments:**
+
+* `<NAME>` — Name for the new identity
+
+###### **Options:**
+
+* `--storage <STORAGE>` — Where to store the session private key
+
+  Default value: `keyring`
+
+  Possible values: `plaintext`, `keyring`, `password`
+
+* `--storage-password-file <FILE>` — Read the storage password from a file instead of prompting (for --storage password)
+
+
+
+## `icp identity delegation sign`
+
+Sign a delegation from the selected identity to a target key
+
+**Usage:** `icp identity delegation sign [OPTIONS] --key-pem <FILE> --duration <DURATION>`
+
+###### **Options:**
+
+* `--key-pem <FILE>` — Public key PEM file of the key to delegate to
+* `--duration <DURATION>` — Delegation validity duration (e.g. "30d", "24h", "3600s", or plain seconds)
+* `--canisters <CANISTERS>` — Canister principals to restrict the delegation to (comma-separated)
+* `--identity <IDENTITY>` — The user identity to run this command as
+
+
+
+## `icp identity delegation use`
+
+Complete a pending delegation identity by providing a signed delegation chain
+
+Reads the JSON output of `icp identity delegation sign` from a file and attaches it to the named identity, making it usable for signing.
+
+**Usage:** `icp identity delegation use --from-json <FILE> <NAME>`
+
+###### **Arguments:**
+
+* `<NAME>` — Name of the pending delegation identity to complete
+
+###### **Options:**
+
+* `--from-json <FILE>` — Path to the delegation chain JSON file (output of `icp identity delegation sign`)
 
 
 
@@ -1040,6 +1120,7 @@ Link an external key to a new identity
 ###### **Subcommands:**
 
 * `hsm` — Link an HSM key to a new identity
+* `web` — Link a web-based identity (such as Internet Identity) to a new icp-cli identity
 
 
 
@@ -1061,6 +1142,32 @@ Link an HSM key to a new identity
   Default value: `0`
 * `--key-id <KEY_ID>` — Key ID on the HSM (e.g., "01" for PIV authentication key)
 * `--pin-file <PIN_FILE>` — Read HSM PIN from a file instead of prompting
+
+
+
+## `icp identity link web`
+
+Link a web-based identity (such as Internet Identity) to a new icp-cli identity
+
+**Usage:** `icp identity link web [OPTIONS] <NAME>`
+
+###### **Arguments:**
+
+* `<NAME>` — Name for the linked identity
+
+###### **Options:**
+
+* `--auth <AUTH>` — Auth domain to sign in at (e.g. id.ai or identity.ce1.com). Its `/.well-known/cli-auth-config` decides the login path
+
+  Default value: `https://id.ai`
+* `--app <APP>` — Delegation domain to get an identity for (e.g. oisy.com). When omitted, the auth domain picks its default (id.ai uses cli.id.ai)
+* `--storage <STORAGE>` — Where to store the session private key
+
+  Default value: `keyring`
+
+  Possible values: `plaintext`, `keyring`, `password`
+
+* `--storage-password-file <FILE>` — Read the storage password from a file instead of prompting (for --storage password)
 
 
 
@@ -1111,6 +1218,18 @@ Display the principal for the current identity
 ###### **Options:**
 
 * `--identity <IDENTITY>` — The user identity to run this command as
+
+
+
+## `icp identity reauth`
+
+Re-authenticate a delegation-based identity
+
+**Usage:** `icp identity reauth <NAME>`
+
+###### **Arguments:**
+
+* `<NAME>` — Name of the identity to re-authenticate
 
 
 
@@ -1338,11 +1457,11 @@ Create a new ICP project from a template
 
 Under the hood templates are generated with `cargo-generate`. See the cargo-generate docs for a guide on how to write your own templates: https://docs.rs/cargo-generate/0.23.7/cargo_generate/
 
-**Usage:** `icp new [OPTIONS] <NAME>`
+**Usage:** `icp new [OPTIONS] [NAME]`
 
 ###### **Arguments:**
 
-* `<NAME>` — Directory to create / project name; if the name isn't in kebab-case, it will be converted to kebab-case unless `--force` is given
+* `<NAME>` — Directory to create / project name; if the name isn't in kebab-case, it will be converted to kebab-case unless `--force` is given. Optional when `--init` is used: defaults to the name of the current directory
 
 ###### **Options:**
 
@@ -1372,7 +1491,7 @@ Under the hood templates are generated with `cargo-generate`. See the cargo-gene
 
 ## `icp project`
 
-Display information about the current project
+Manage the current project
 
 **Usage:** `icp project <COMMAND>`
 
@@ -1469,6 +1588,7 @@ Synchronize canisters
 
 ###### **Options:**
 
+* `--proxy <PROXY>` — Principal of a proxy canister to route sync plugin calls to the target canister through
 * `-e`, `--environment <ENVIRONMENT>` — Override the environment to connect to. By default, the local environment is used
 * `--identity <IDENTITY>` — The user identity to run this command as
 
@@ -1506,6 +1626,7 @@ Display the token balance on the ledger (default token: icp)
 * `-e`, `--environment <ENVIRONMENT>` — Override the environment to connect to. By default, the local environment is used
 * `--identity <IDENTITY>` — The user identity to run this command as
 * `--subaccount <SUBACCOUNT>` — The subaccount to check the balance for
+* `--of-principal <OF_PRINCIPAL>` — Check the balance of this principal instead of the current identity
 * `--json` — Output command results as JSON
 * `-q`, `--quiet` — Suppress human-readable output; print only the balance
 

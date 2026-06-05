@@ -190,8 +190,8 @@ pub(crate) async fn exec(ctx: &Context, args: &CallArgs) -> Result<(), anyhow::E
                 return Ok(());
             }
             arguments
-                .to_bytes()
-                .context("failed to serialize candid arguments")?
+                .to_bytes_with_types(type_env, &func.args)
+                .context("failed to serialize candid arguments with specific types")?
         }
         (Some(_), Some(ResolvedArgs::Bytes(bytes))) => bytes,
         (Some((type_env, func)), Some(ResolvedArgs::Candid(arguments))) => arguments
@@ -228,78 +228,72 @@ pub(crate) async fn exec(ctx: &Context, args: &CallArgs) -> Result<(), anyhow::E
     };
 
     let mut term = Term::buffered_stdout();
-    let res_hex = || format!("response (hex): {}", hex::encode(&res));
-    let mut json_response = JsonCallResponse {
-        response_bytes: hex::encode(&res),
-        response_text: None,
-        response_candid: None,
-    };
+    let decoded = decode_response(&res, args.output, declared_method.as_ref());
 
-    // catch errors, because the json result should be printed regardless of errors
-    let res = (|| {
-        match args.output {
-            CallOutputMode::Auto => {
-                if let Ok(ret) = try_decode_candid(&res, declared_method.as_ref()) {
-                    if args.json {
-                        json_response.response_candid = Some(format!("{ret}"));
-                    } else {
-                        print_candid_for_term(&mut term, &ret)
-                            .context("failed to print candid return value")?;
-                    }
-                } else if let Ok(s) = std::str::from_utf8(&res) {
-                    if args.json {
-                        json_response.response_text = Some(s.to_string());
-                    } else {
-                        writeln!(term, "{s}")?;
-                        term.flush()?;
-                    }
-                } else if !args.json {
-                    writeln!(term, "{}", hex::encode(&res))?;
-                    term.flush()?;
-                }
-            }
-            CallOutputMode::Candid => {
-                let ret =
-                    try_decode_candid(&res, declared_method.as_ref()).with_context(res_hex)?;
-                if args.json {
-                    json_response.response_candid = Some(format!("{ret}"));
-                } else {
-                    print_candid_for_term(&mut term, &ret)
-                        .context("failed to print candid return value")?;
-                }
-            }
-            CallOutputMode::Text => {
-                let s = std::str::from_utf8(&res)
-                    .with_context(res_hex)
-                    .context("response is not valid UTF-8")?;
-                if args.json {
-                    json_response.response_text = Some(s.to_string());
-                } else {
-                    writeln!(term, "{s}")?;
-                    term.flush()?;
-                }
-            }
-            CallOutputMode::Hex => {
-                writeln!(term, "{}", hex::encode(&res))?;
-                term.flush()?;
-            }
-        };
-        anyhow::Ok(())
-    })();
     if args.json {
-        let write_result = serde_json::to_writer(term, &json_response);
-        if let Err(write_err) = write_result {
-            if let Err(decode_err) = res {
+        let envelope = JsonCallResponse::build(&res, decoded.as_ref().ok());
+        let write_result = serde_json::to_writer(&term, &envelope);
+        match (write_result, decoded) {
+            (Ok(()), decode_result) => {
+                decode_result?;
+            }
+            (Err(write_err), Err(decode_err)) => {
+                // Prefer the decode error; the write failure is incidental.
                 error!("failed to write JSON response: {write_err}");
                 return Err(decode_err);
-            } else {
+            }
+            (Err(write_err), Ok(_)) => {
                 return Err(write_err).context("failed to write JSON response");
             }
         }
+    } else {
+        match decoded? {
+            Decoded::Candid(ret) => print_candid_for_term(&mut term, &ret)
+                .context("failed to print candid return value")?,
+            Decoded::Text(s) => writeln!(term, "{s}")?,
+            Decoded::Bytes => writeln!(term, "{}", hex::encode(&res))?,
+        }
     }
-    res?;
+
+    // term is buffered; this single flush covers all output paths (json and non-json).
+    term.flush()?;
 
     Ok(())
+}
+
+/// A response decoded according to the requested `CallOutputMode`.
+enum Decoded {
+    Candid(IDLArgs),
+    Text(String),
+    /// No decoding was attempted or all attempts failed; emit raw bytes as hex.
+    Bytes,
+}
+
+fn decode_response(
+    res: &[u8],
+    mode: CallOutputMode,
+    method: Option<&(TypeEnv, Function)>,
+) -> Result<Decoded, anyhow::Error> {
+    let res_hex = || format!("response (hex): {}", hex::encode(res));
+    match mode {
+        CallOutputMode::Auto => {
+            if let Ok(args) = try_decode_candid(res, method) {
+                Ok(Decoded::Candid(args))
+            } else if let Ok(s) = std::str::from_utf8(res) {
+                Ok(Decoded::Text(s.to_string()))
+            } else {
+                Ok(Decoded::Bytes)
+            }
+        }
+        CallOutputMode::Candid => try_decode_candid(res, method)
+            .map(Decoded::Candid)
+            .with_context(res_hex),
+        CallOutputMode::Text => std::str::from_utf8(res)
+            .map(|s| Decoded::Text(s.to_string()))
+            .with_context(res_hex)
+            .context("response is not valid UTF-8"),
+        CallOutputMode::Hex => Ok(Decoded::Bytes),
+    }
 }
 
 #[derive(Serialize)]
@@ -307,6 +301,22 @@ struct JsonCallResponse {
     response_bytes: String,
     response_text: Option<String>,
     response_candid: Option<String>,
+}
+
+impl JsonCallResponse {
+    fn build(res: &[u8], decoded: Option<&Decoded>) -> Self {
+        Self {
+            response_bytes: hex::encode(res),
+            response_text: match decoded {
+                Some(Decoded::Text(s)) => Some(s.clone()),
+                _ => None,
+            },
+            response_candid: match decoded {
+                Some(Decoded::Candid(args)) => Some(format!("{args}")),
+                _ => None,
+            },
+        }
+    }
 }
 
 /// Tries to decode the response as Candid. Returns `None` if decoding fails.
@@ -337,7 +347,6 @@ pub(crate) fn print_candid_for_term(term: &mut Term, args: &IDLArgs) -> io::Resu
     } else {
         writeln!(term, "{args}")?;
     }
-    term.flush()?;
     Ok(())
 }
 

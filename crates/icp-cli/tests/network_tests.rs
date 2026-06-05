@@ -68,6 +68,7 @@ async fn network_same_port() {
     ctx.ping_until_healthy(&project_dir_a, "sameport-network");
 
     eprintln!("second network start attempt in another project");
+
     ctx.icp()
         .current_dir(&project_dir_b)
         .args(["network", "start", "sameport-network"])
@@ -75,7 +76,7 @@ async fn network_same_port() {
         .failure()
         .stderr(contains(format!(
             "Error: port 8080 is in use by the sameport-network network of the project at '{}'",
-            dunce::canonicalize(&project_dir_a).unwrap().display()
+            project_dir_a
         )));
 }
 
@@ -192,26 +193,14 @@ async fn deploy_to_other_projects_network() {
 
     ctx.icp()
         .current_dir(&projb)
-        .args([
-            "deploy",
-            "--subnet",
-            common::SUBNET_ID,
-            "--environment",
-            "environment-1",
-        ])
+        .args(["deploy", "--environment", "environment-1"])
         .assert()
         .success();
 
     // Deploy project (second time)
     ctx.icp()
         .current_dir(&projb)
-        .args([
-            "deploy",
-            "--subnet",
-            common::SUBNET_ID,
-            "--environment",
-            "environment-1",
-        ])
+        .args(["deploy", "--environment", "environment-1"])
         .assert()
         .success();
 
